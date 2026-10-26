@@ -1,0 +1,115 @@
+import { asyncHandler } from '../utils/asyncHandler.js';
+import { ApiResponse } from '../utils/apiResponse.js';
+import { ApiError } from '../utils/apiError.js';
+import {
+  listLiveDriverMapMetadata,
+  listDriverLastKnownLocations,
+  isLiveLocationReady,
+} from '../services/driverLocation.service.js';
+import { findDriversWithinRadius } from '../services/driverFinder.service.js';
+import { NEARBY_DRIVERS } from '../constants/bookingStatus.js';
+
+/**
+ * GET /admin/drivers/live
+ *
+ * Returns driver profile metadata (name, phone, active trip) for the admin
+ * live map. Positions are NOT included — those come from Firebase RTDB.
+ * Covers currently-online drivers plus optional `?ids=` (Firebase pin ids).
+ */
+export const getLiveDriversSnapshot = asyncHandler(async (req, res) => {
+  const rawIds = typeof req.query.ids === 'string' ? req.query.ids : '';
+  const extraIds = rawIds
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+    .slice(0, 500);
+  const items = await listLiveDriverMapMetadata(extraIds);
+
+  return res.status(200).json(
+    new ApiResponse(
+      200,
+      {
+        items,
+        liveLocationReady: isLiveLocationReady(),
+      },
+      'Live driver metadata',
+    ),
+  );
+});
+
+/**
+ * GET /admin/drivers/locations
+ *
+ * Fleet map for the admin panel: last-known position of every approved
+ * driver, ONLINE and OFFLINE. Positions come from the persisted Mongo
+ * `Driver.location` snapshot (survives disconnect), unlike `/drivers/live`
+ * which is online-only and carries no coordinates.
+ */
+export const getDriverLocationsSnapshot = asyncHandler(async (req, res) => {
+  const includeUnlocated = req.query.includeUnlocated === 'true';
+  const items = await listDriverLastKnownLocations({ includeUnlocated });
+
+  return res.status(200).json(
+    new ApiResponse(
+      200,
+      {
+        items,
+        liveLocationReady: isLiveLocationReady(),
+      },
+      'Driver last-known locations',
+    ),
+  );
+});
+
+/**
+ * GET /auth/drivers/nearby?lat=&lng=&radius=&limit=&carTypeId=
+ *
+ * Returns online, approved drivers near the user, sorted by distance. Powers
+ * the "drivers near you" widget on the home screen and any other surface
+ * that needs ad-hoc nearby-driver data. The booking dispatcher does NOT
+ * call this endpoint — it talks to `driverFinder.service` directly so it
+ * can use the expanding-radius variant.
+ */
+export const getNearbyDriversForUser = asyncHandler(async (req, res) => {
+  const lat = Number(req.query.lat);
+  const lng = Number(req.query.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    throw new ApiError(400, 'lat and lng query params are required');
+  }
+
+  const radiusMeters = Math.min(
+    Number(req.query.radius) || NEARBY_DRIVERS.DEFAULT_RADIUS_METERS,
+    NEARBY_DRIVERS.MAX_RADIUS_METERS,
+  );
+  const limit = Math.min(
+    Number(req.query.limit) || NEARBY_DRIVERS.DEFAULT_LIMIT,
+    NEARBY_DRIVERS.MAX_LIMIT,
+  );
+
+  const carTypeIds = req.query.carTypeId
+    ? String(req.query.carTypeId).split(',').filter(Boolean)
+    : undefined;
+
+  const drivers = await findDriversWithinRadius({
+    lat,
+    lng,
+    radiusMeters,
+    limit,
+    carTypeIds,
+    includeOnTrip: false,
+  });
+
+  return res.status(200).json(
+    new ApiResponse(
+      200,
+      {
+        drivers,
+        radiusMeters,
+        liveLocationReady: isLiveLocationReady(),
+        center: { lat, lng },
+      },
+      'Nearby drivers fetched',
+    ),
+  );
+});
+

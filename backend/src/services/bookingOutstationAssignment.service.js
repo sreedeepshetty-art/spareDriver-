@@ -1,0 +1,1050 @@
+import mongoose from 'mongoose';
+import Booking from '../models/booking.model.js';
+import Car from '../models/user/car.model.js';
+import { Driver } from '../models/driverModels/driver.model.js';
+import { ApiError } from '../utils/apiError.js';
+import {
+  BOOKING_STATUS,
+  BOOKING_PAYMENT_STATUS,
+  DISPATCH_RESPONSE,
+  SCHEDULED_BOOKING,
+} from '../constants/bookingStatus.js';
+import { SERVICE_TYPES } from '../constants/serviceTypes.js';
+import { S2C_EVENTS } from '../constants/socketEvents.js';
+import {
+  emitToUser,
+  emitToDriver,
+  emitToBooking,
+  emitToAdmins,
+} from '../utils/socketEmitters.js';
+import { notifyDriverOrderAssigned } from '../utils/notificationDispatch.js';
+import {
+  isSuperAdmin,
+} from '../constants/staffPermissions.js';
+import {
+  estimateBookingWindow,
+  applyBuffer,
+  getDriverConflictMap,
+} from './driverConflict.service.js';
+import { getVehicleConflicts } from './vehicleConflict.service.js';
+import { loadScheduledDispatchConfig } from './bookingScheduled.service.js';
+import { resolveCarTypeObjectId } from '../utils/carTypeResolve.js';
+import { cancelNoShowSchedule } from './bookingNoShowTimeout.service.js';
+import {
+  netPlatformRevenueFromFareSnapshot,
+  recordCompletedTripPlatformRevenue,
+} from './platformRevenue.service.js';
+import { creditWalletService, releaseWalletHoldService } from './wallet.service.js';
+import { creditDriverWalletService } from './driverWallet.service.js';
+import { clearPendingExtensionsOnTerminate } from './bookingExtension.service.js';
+import { WALLET_TXN_SOURCE } from '../models/walletTransaction.model.js';
+import {
+  issueBookingRefundService,
+  REFUND_INITIATED_BY,
+  REFUND_PAYOUT_METHOD,
+} from './refund.service.js';
+
+const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+/**
+ * Outstation bookings admin list + manual assign.
+ *
+ *   New outstation bookings auto-search (inbox) first. Unmatched rows
+ *   past `scheduled.escalateAt` move into the shared Emergency Pool.
+ *   This page lists ALL outstation bookings (every status). Staff can
+ *   still assign from Searching / Pending / Emergency Pool / No-drivers.
+ *
+ *   Safety gates before DRIVER_ASSIGNED:
+ *
+ *     1. Vehicle conflict — the booking's `carId` must not be on any
+ *        OTHER active booking whose buffered window overlaps the
+ *        outstation window.
+ *     2. Driver conflict — the chosen driver must not be on any OTHER
+ *        active booking whose buffered window overlaps the outstation
+ *        window. This catches ongoing rides, future scheduled rides,
+ *        and other outstation trips.
+ *     3. Atomic claim — the booking is flipped from PENDING_ASSIGNMENT
+ *        to DRIVER_ASSIGNED via `findOneAndUpdate` with the status as
+ *        a guard. Two admins clicking "Assign" simultaneously can
+ *        never both succeed; the loser sees a 409.
+ *
+ *   A post-claim re-check using `(_id ASC)` as a tiebreaker handles the
+ *   even rarer race where two admins assign the SAME driver to TWO
+ *   different outstation bookings whose windows overlap. The booking
+ *   with the larger `_id` loses and is rolled back to PENDING_ASSIGNMENT.
+ *
+ *   Buffer:
+ *     ServicePricing.scheduledDispatch.RIDE_BUFFER_MINUTES (default 120)
+ *     — same knob the wave dispatcher reads, so manual + auto pipelines
+ *     stay in lockstep.
+ */
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+
+async function resolveBufferMinutesFor(serviceType) {
+  try {
+    const cfg = await loadScheduledDispatchConfig(serviceType);
+    const value = Number(cfg?.RIDE_BUFFER_MINUTES);
+    if (Number.isFinite(value) && value >= 0) return value;
+  } catch {
+    /* fall through */
+  }
+  return SCHEDULED_BOOKING.RIDE_BUFFER_MINUTES;
+}
+
+function zoneScopeForStaff(staff) {
+  if (!staff) return [];
+  if (isSuperAdmin(staff)) return null;
+  const ids = (staff.assignedZones || [])
+    .map((id) => {
+      try {
+        return new mongoose.Types.ObjectId(String(id));
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+  return ids;
+}
+
+/**
+ * Whether an outstation assignment should immediately set
+ * `Driver.isOnTrip = true`. Pickup within one buffer window of now →
+ * lock; otherwise let the driver keep taking offers until the
+ * conflict-service shadow filters them out. Mirrors the emergency-
+ * pool rule so manual + auto pipelines behave identically.
+ */
+function shouldImmediatelyLockOutstation(booking, bufferMinutes) {
+  const startSrc =
+    booking?.outstation?.pickupAt || booking?.outstation?.startDate;
+  if (!startSrc) return true;
+  const startMs = new Date(startSrc).getTime();
+  if (!Number.isFinite(startMs)) return true;
+  const lockLeadMs = Math.max(0, Number(bufferMinutes) || 0) * 60_000;
+  return startMs - Date.now() <= lockLeadMs;
+}
+
+function bookingWindowMs(booking) {
+  return estimateBookingWindow(booking);
+}
+
+/* ------------------------------------------------------------------ */
+/* Listing                                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Paginated list of outstation bookings sitting in PENDING_ASSIGNMENT.
+ *
+ *   super admin              → every row across the platform
+ *   sub_admin / team_member  → rows whose `zoneIds` overlap their `assignedZones`
+ *                       (returns [] when the staff has no zones)
+ *
+ * Supported filters (all optional, all combine with AND):
+ *   - search          booking number / id substring
+ *   - city            case-insensitive substring on `pickup.city`
+ *   - bookingType     'instant' | 'scheduled'
+ *   - zoneId          a single zone the row must include
+ *   - dateFrom        ISO; outstation.startDate ≥ dateFrom
+ *   - dateTo          ISO; outstation.startDate ≤ dateTo
+ *
+ * Ordered by `outstation.startDate` ASC so the soonest-departing trip
+ * sits at the top. Returns the standard pagination envelope.
+ */
+/**
+ * Paginated list of outstation bookings (all statuses by default).
+ * Optional `status` narrows the queue. Team members are zone-scoped.
+ *
+ * Query params:
+ *   - page, limit
+ *   - search           booking # / ObjectId
+ *   - city             pickup.city regex
+ *   - status           single booking status
+ *   - zoneId           zone filter
+ *   - dateFrom/dateTo  outstation.pickupAt / startDate window
+ */
+export async function listOutstationAssignmentsService({ staff, query = {} }) {
+  const {
+    page = 1,
+    limit = 20,
+    search,
+    city,
+    status,
+    bookingType,
+    zoneId,
+    dateFrom,
+    dateTo,
+  } = query;
+
+  const skip = (Math.max(1, parseInt(page, 10)) - 1) * parseInt(limit, 10);
+
+  const filter = {
+    serviceType: SERVICE_TYPES.OUTSTATION,
+    isDeleted: false,
+  };
+
+  if (status) {
+    filter.status = String(status);
+  }
+
+  const scope = zoneScopeForStaff(staff);
+  if (scope !== null) {
+    if (!scope.length) {
+      return { bookings: [], total: 0, page: parseInt(page, 10), pages: 0 };
+    }
+    filter.zoneIds = { $in: scope };
+  }
+
+  if (zoneId) {
+    try {
+      const zoneObj = new mongoose.Types.ObjectId(String(zoneId));
+      // Combine with the staff scope above so team_members can't
+      // bypass their assignedZones by passing an out-of-scope zoneId.
+      if (filter.zoneIds?.$in) {
+        const allowed = filter.zoneIds.$in.map(String);
+        if (allowed.includes(String(zoneObj))) {
+          filter.zoneIds = { $in: [zoneObj] };
+        } else {
+          return { bookings: [], total: 0, page: parseInt(page, 10), pages: 0 };
+        }
+      } else {
+        filter.zoneIds = { $in: [zoneObj] };
+      }
+    } catch {
+      /* ignore bad id */
+    }
+  }
+
+  if (search) {
+    const isObjectId = /^[0-9a-fA-F]{24}$/.test(search);
+    filter.$or = [
+      { bookingNumber: { $regex: search, $options: 'i' } },
+      ...(isObjectId ? [{ _id: search }] : []),
+    ];
+  }
+  if (city) {
+    filter['pickup.city'] = { $regex: city, $options: 'i' };
+  }
+  if (bookingType) {
+    filter.bookingType = bookingType;
+  }
+  if (dateFrom || dateTo) {
+    const dateFilter = {};
+    if (dateFrom) {
+      const d = new Date(dateFrom);
+      if (!Number.isNaN(d.getTime())) dateFilter.$gte = d;
+    }
+    if (dateTo) {
+      const d = new Date(dateTo);
+      if (!Number.isNaN(d.getTime())) dateFilter.$lte = d;
+    }
+    if (Object.keys(dateFilter).length) {
+      filter.$and = [
+        ...(filter.$and || []),
+        {
+          $or: [
+            { 'outstation.pickupAt': dateFilter },
+            { 'outstation.startDate': dateFilter },
+          ],
+        },
+      ];
+    }
+  }
+
+  const [bookings, total] = await Promise.all([
+    Booking.find(filter)
+      .populate('userId', 'name phone_no')
+      .populate('driverId', 'name phone rating')
+      .populate('zoneIds', 'name code city')
+      .sort({ 'outstation.pickupAt': -1, 'outstation.startDate': -1, createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit, 10))
+      .lean(),
+    Booking.countDocuments(filter),
+  ]);
+
+  return {
+    bookings,
+    total,
+    page: parseInt(page, 10),
+    pages: Math.ceil(total / Math.max(1, parseInt(limit, 10))),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Detail (with conflicts)                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Load a single PENDING_ASSIGNMENT outstation booking + a pre-computed
+ * vehicle-conflict report for its `carId`. The driver picker queries
+ * conflicts per-candidate separately.
+ *
+ * Returns `null` if the booking exists but the calling staff isn't
+ * allowed to see it (out-of-zone team_member) — the controller maps
+ * this to a 404.
+ */
+export async function getOutstationAssignmentDetailService(bookingId, staff) {
+  const booking = await Booking.findOne({
+    _id: bookingId,
+    isDeleted: false,
+  })
+    .populate('userId', 'name phone_no email')
+    .populate('zoneIds', 'name code city')
+    .lean();
+  if (!booking) return null;
+
+  // Zone scoping for team_members.
+  const scope = zoneScopeForStaff(staff);
+  if (scope !== null) {
+    const allowedZoneIds = new Set(scope.map(String));
+    const bookingZones = (booking.zoneIds || []).map((z) =>
+      String(z?._id || z),
+    );
+    if (!bookingZones.some((id) => allowedZoneIds.has(id))) {
+      return null;
+    }
+  }
+
+  // Load the car so the UI can show vehicle number / make / model and
+  // surface vehicle conflicts before the driver picker even opens.
+  let car = null;
+  if (booking.carId) {
+    car = await Car.findById(booking.carId)
+      .populate('carTypeId', 'name')
+      .populate('brandId', 'name')
+      .populate('modelId', 'name')
+      .populate('fuelTypeId', 'name')
+      .lean();
+  }
+
+  const baseWindow = bookingWindowMs(booking);
+  const bufferMinutes = await resolveBufferMinutesFor(booking.serviceType);
+  const buffered = baseWindow ? applyBuffer(baseWindow, bufferMinutes) : null;
+
+  const vehicleConflicts = buffered
+    ? await getVehicleConflicts({
+      carId: booking.carId,
+      window: buffered,
+      excludeBookingId: booking._id,
+      bufferMinutes,
+    })
+    : [];
+
+  return {
+    booking,
+    car,
+    bufferMinutes,
+    window: baseWindow
+      ? {
+        startMs: baseWindow.startMs,
+        endMs: baseWindow.endMs,
+        bufferedStartMs: buffered.startMs,
+        bufferedEndMs: buffered.endMs,
+      }
+      : null,
+    vehicleConflicts,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Driver picker                                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Returns a ranked list of approved drivers (online first, then by
+ * rating + experience) along with a per-driver `conflicts` array. The
+ * UI uses the conflict array to render an "Already booked" badge plus
+ * the overlapping bookings on hover.
+ *
+ * `carTypeId` is optional. When set we filter to drivers whose
+ * `carTypeExperience` includes it; otherwise we return everyone (the
+ * caller can show a "no car type filter" hint).
+ */
+export async function listAvailableDriversForOutstationService(
+  bookingId,
+  {
+    search,
+    page = 1,
+    limit = 50,
+    staff,
+    carTypeMatch = 'true',
+    minRating,
+    onlineOnly,
+    allIndiaOnly,
+    minDrivingHoursPerDay,
+    zoneId,
+  } = {},
+) {
+  const detail = await getOutstationAssignmentDetailService(bookingId, staff);
+  if (!detail) {
+    throw new ApiError(404, 'Outstation booking not found or out of zone');
+  }
+  const { booking, car, bufferMinutes, window } = detail;
+
+  if (
+    booking.status !== BOOKING_STATUS.PENDING_ASSIGNMENT
+    && booking.status !== BOOKING_STATUS.SEARCHING
+    && booking.status !== BOOKING_STATUS.IN_EMERGENCY_POOL
+    && booking.status !== BOOKING_STATUS.NO_DRIVERS_FOUND
+  ) {
+    throw new ApiError(
+      409,
+      `Booking is no longer pending assignment (status: ${booking.status})`,
+    );
+  }
+
+  const pageNum = Math.max(1, parseInt(page, 10));
+  const limitNum = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 300);
+  const skip = (pageNum - 1) * limitNum;
+
+  const carTypeId = await resolveCarTypeObjectId(car?.carTypeId?._id || car?.carTypeId);
+
+  // Resolve the booking's zone IDs so we can filter to drivers who opted
+  // into those zones. `zoneIds` on the booking is already populated with
+  // objects by `getOutstationAssignmentDetailService`.
+  const bookingZoneIds = (booking.zoneIds || []).map((z) => {
+    try { return new mongoose.Types.ObjectId(String(z?._id || z)); } catch { return null; }
+  }).filter(Boolean);
+
+  const match = {
+    approvalStatus: 'approved',
+    isDeleted: { $ne: true },
+    // Drivers must have explicitly opted in to outstation.
+    availableForOutstation: true,
+  };
+
+  // Zone filter — only show drivers who opted into at least one of the
+  // booking's pickup zones. Optional `zoneId` narrows to a single zone.
+  let zoneFilterIds = bookingZoneIds;
+  if (zoneId) {
+    const selected = String(zoneId);
+    const allowed = bookingZoneIds.map((id) => String(id));
+    if (allowed.includes(selected)) {
+      try {
+        zoneFilterIds = [new mongoose.Types.ObjectId(selected)];
+      } catch { /* ignore bad id */ }
+    }
+  }
+  if (zoneFilterIds.length) {
+    match.preferredOutstationZones = { $in: zoneFilterIds };
+  }
+
+  if (carTypeId && carTypeMatch !== 'false') {
+    match.carTypeExperience = carTypeId;
+  }
+  if (minRating != null && minRating !== '') {
+    const rating = Number(minRating);
+    if (Number.isFinite(rating) && rating > 0) match.rating = { $gte: rating };
+  }
+  if (onlineOnly === 'true' || onlineOnly === true) {
+    match.isOnline = true;
+  }
+  if (allIndiaOnly === 'true' || allIndiaOnly === true) {
+    match.outstationAllIndiaOk = true;
+  }
+  if (minDrivingHoursPerDay != null && minDrivingHoursPerDay !== '') {
+    const hours = Number(minDrivingHoursPerDay);
+    if (Number.isFinite(hours) && hours > 0) {
+      match.outstationMaxDrivingHoursPerDay = { $gte: hours };
+    }
+  }
+  if (search) {
+    const q = String(search).trim();
+    if (q) {
+      match.$or = [
+        { name: { $regex: q, $options: 'i' } },
+        { phone: { $regex: q, $options: 'i' } },
+      ];
+    }
+  }
+
+  const [drivers, total] = await Promise.all([
+    Driver.find(match)
+      .select(
+        'name phone email rating experienceYears isOnline isOnTrip location lastLocationAt carTypeExperience availableForOutstation preferredOutstationZones outstationAvailabilityUpdatedAt outstationAllIndiaOk outstationMaxDrivingHoursPerDay cancellationStats',
+      )
+      .populate('carTypeExperience', 'name')
+      .populate('preferredOutstationZones', 'name city')
+      .sort({
+        'cancellationStats.priorityPenaltyPoints': 1,
+        isOnline: -1,
+        rating: -1,
+        experienceYears: -1,
+      })
+      .skip(skip)
+      .limit(limitNum)
+      .lean(),
+    Driver.countDocuments(match),
+  ]);
+
+  // Bulk conflict lookup for every candidate.
+  let conflictMap = {};
+  if (drivers.length && window) {
+    conflictMap = await getDriverConflictMap({
+      driverIds: drivers.map((d) => d._id),
+      window: {
+        startMs: window.bufferedStartMs,
+        endMs: window.bufferedEndMs,
+      },
+      excludeBookingId: booking._id,
+      bufferMinutes,
+    });
+  }
+
+  const enriched = drivers.map((d) => ({
+    ...d,
+    conflicts: conflictMap[String(d._id)] || [],
+    hasConflict: Boolean(conflictMap[String(d._id)]?.length),
+  }));
+
+  return {
+    drivers: enriched,
+    total,
+    page: pageNum,
+    bufferMinutes,
+    window,
+    carTypeId: carTypeId ? String(carTypeId) : null,
+    bookingZoneIds: bookingZoneIds.map(String),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Manual assignment                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Admin / sub_admin picks a specific driver for an outstation booking.
+ *
+ *   Race protection:
+ *     - CAS on `Booking.findOneAndUpdate({ status: PENDING_ASSIGNMENT,
+ *       driverId: null })` → only one admin can ever flip a given
+ *       booking to DRIVER_ASSIGNED.
+ *     - Post-CAS re-check on driver + vehicle conflicts; if another
+ *       overlapping booking was committed concurrently, the booking
+ *       with the LARGER `_id` rolls back to PENDING_ASSIGNMENT
+ *       (deterministic winner — both sides agree on who keeps the
+ *       assignment without needing a transaction).
+ *
+ *   Locking:
+ *     - `Driver.isOnTrip = true` only if pickup is within one buffer
+ *       window of now. Far-future outstation assignments leave the
+ *       driver in the dispatch pool; the conflict service prevents
+ *       overlapping offers.
+ */
+export async function adminAssignDriverToOutstationService(
+  bookingId,
+  driverId,
+  { staffId, notes = '', staff } = {},
+) {
+  if (!bookingId || !driverId) {
+    throw new ApiError(400, 'bookingId and driverId are required');
+  }
+
+  // 1. Load booking + zone-scope check.
+  const detail = await getOutstationAssignmentDetailService(bookingId, staff);
+  if (!detail) throw new ApiError(404, 'Outstation booking not found or out of zone');
+  const { booking: bookingDoc, bufferMinutes, window } = detail;
+
+  if (bookingDoc.serviceType !== SERVICE_TYPES.OUTSTATION) {
+    throw new ApiError(400, 'Only outstation bookings can be assigned from this queue');
+  }
+  if (
+    bookingDoc.status !== BOOKING_STATUS.PENDING_ASSIGNMENT
+    && bookingDoc.status !== BOOKING_STATUS.SEARCHING
+    && bookingDoc.status !== BOOKING_STATUS.IN_EMERGENCY_POOL
+    && bookingDoc.status !== BOOKING_STATUS.NO_DRIVERS_FOUND
+  ) {
+    throw new ApiError(
+      409,
+      `Booking is no longer pending assignment (status: ${bookingDoc.status})`,
+    );
+  }
+  if (!window) {
+    throw new ApiError(500, 'Booking is missing its outstation window — cannot validate');
+  }
+
+  // 2. Driver sanity check. We also re-verify the outstation opt-in
+  // here \u2014 the picker already filters on it, but the FE could
+  // hold a stale list (driver toggled off between fetch and assign),
+  // and we don't want a multi-day overnight job pushed onto a driver
+  // who has explicitly opted out.
+  const driver = await Driver.findOne({
+    _id: driverId,
+    isDeleted: { $ne: true },
+    approvalStatus: 'approved',
+  });
+  if (!driver) throw new ApiError(404, 'Driver not found or not approved');
+  if (!driver.availableForOutstation) {
+    throw new ApiError(
+      409,
+      'This driver has opted out of outstation assignments. Pick another driver.',
+    );
+  }
+
+  // 3. Vehicle conflict (excluding this booking).
+  const vehicleConflicts = await getVehicleConflicts({
+    carId: bookingDoc.carId,
+    window: { startMs: window.bufferedStartMs, endMs: window.bufferedEndMs },
+    excludeBookingId: bookingDoc._id,
+    bufferMinutes,
+  });
+  if (vehicleConflicts.length) {
+    const err = new ApiError(
+      409,
+      'This vehicle is already booked in an overlapping window. Cannot assign.',
+    );
+    err.data = { code: 'VEHICLE_CONFLICT', conflicts: vehicleConflicts };
+    throw err;
+  }
+
+  // 4. Driver conflict (excluding this booking).
+  const driverConflictMap = await getDriverConflictMap({
+    driverIds: [driver._id],
+    window: { startMs: window.bufferedStartMs, endMs: window.bufferedEndMs },
+    excludeBookingId: bookingDoc._id,
+    bufferMinutes,
+  });
+  const driverConflicts = driverConflictMap[String(driver._id)] || [];
+  if (driverConflicts.length) {
+    const hasSubscription = driverConflicts.some(
+      (c) => c.conflictKind === 'subscription' || c.bookingType === 'subscription',
+    );
+    const err = new ApiError(
+      409,
+      hasSubscription
+        ? 'Driver is assigned to a dedicated subscription during this period. Pick another driver.'
+        : 'Driver is already assigned to an overlapping booking. Pick another driver.',
+    );
+    err.data = { code: 'DRIVER_CONFLICT', conflicts: driverConflicts };
+    throw err;
+  }
+
+  // 5. Atomic CAS — flip the booking to DRIVER_ASSIGNED in a single
+  // findOneAndUpdate. Two admins clicking Assign on the same booking
+  // are serialised here: only one update matches the guard.
+  const now = new Date();
+  const previousPending = (bookingDoc.dispatch?.pendingOfferIds || []).map(String);
+  const updatedBooking = await Booking.findOneAndUpdate(
+    {
+      _id: bookingDoc._id,
+      status: {
+        $in: [
+          BOOKING_STATUS.PENDING_ASSIGNMENT,
+          BOOKING_STATUS.SEARCHING,
+          BOOKING_STATUS.IN_EMERGENCY_POOL,
+          BOOKING_STATUS.NO_DRIVERS_FOUND,
+        ],
+      },
+      driverId: null,
+      isDeleted: false,
+    },
+    {
+      $set: {
+        driverId: driver._id,
+        status: BOOKING_STATUS.DRIVER_ASSIGNED,
+        'dispatch.pendingOfferIds': [],
+        'dispatch.currentExpiresAt': null,
+        'timeline.driverAssignedAt': now,
+        'scheduled.emergencyPool.assignedBy': staffId || null,
+        'scheduled.emergencyPool.assignedAt': now,
+        'scheduled.emergencyPool.notes': notes || '',
+      },
+      $push: {
+        'dispatch.offers': {
+          driverId: driver._id,
+          offeredAt: now,
+          respondedAt: now,
+          response: DISPATCH_RESPONSE.ACCEPTED,
+          distanceMeters: null,
+        },
+      },
+    },
+    { new: true },
+  );
+  if (!updatedBooking) {
+    throw new ApiError(409, 'Booking was just assigned by someone else');
+  }
+
+  // 6. Post-CAS conflict re-check — handles the race where two admins
+  // assign THE SAME driver to two DIFFERENT bookings whose windows
+  // overlap. Both transactions pass the pre-check, both CAS succeed
+  // (different booking IDs), then both detect each other. We use
+  // `_id` (Mongo ObjectId, time-ordered) as the tiebreaker: the
+  // booking with the LARGER `_id` rolls back, the smaller keeps.
+  const postCheck = await getDriverConflictMap({
+    driverIds: [driver._id],
+    window: { startMs: window.bufferedStartMs, endMs: window.bufferedEndMs },
+    excludeBookingId: bookingDoc._id,
+    bufferMinutes,
+  });
+  const lateConflicts = postCheck[String(driver._id)] || [];
+  if (lateConflicts.length) {
+    const ourId = String(updatedBooking._id);
+    const weLose = lateConflicts.some((c) => String(c._id) < ourId);
+    if (weLose) {
+      await Booking.updateOne(
+        { _id: updatedBooking._id },
+        {
+          $set: {
+            driverId: null,
+            status: BOOKING_STATUS.PENDING_ASSIGNMENT,
+            'timeline.driverAssignedAt': null,
+          },
+        },
+      );
+      const err = new ApiError(
+        409,
+        'Driver was assigned to an overlapping booking by another admin. Pick a different driver.',
+      );
+      err.data = { code: 'DRIVER_CONFLICT_RACE', conflicts: lateConflicts };
+      throw err;
+    }
+  }
+
+  // 7. Lock the driver if pickup is imminent.
+  const lockNow = shouldImmediatelyLockOutstation(updatedBooking, bufferMinutes);
+  if (lockNow) {
+    await Driver.updateOne(
+      { _id: driver._id, isOnTrip: false },
+      { $set: { isOnTrip: true } },
+    );
+  }
+
+  // 8. Socket fan-out — mirror the emergency-pool service.
+  const userPayload = {
+    bookingId: String(updatedBooking._id),
+    status: updatedBooking.status,
+    paymentMode: updatedBooking.paymentMode,
+    paymentStatus: updatedBooking.paymentStatus,
+    driverId: String(driver._id),
+    timeline: updatedBooking.timeline?.toObject?.() || updatedBooking.timeline,
+  };
+  const driverPayload = {
+    bookingId: String(updatedBooking._id),
+    status: updatedBooking.status,
+    driverId: String(driver._id),
+    timeline: updatedBooking.timeline?.toObject?.() || updatedBooking.timeline,
+  };
+
+  emitToUser(updatedBooking.userId, S2C_EVENTS.BOOKING_UPDATED, userPayload);
+  emitToBooking(updatedBooking._id, S2C_EVENTS.BOOKING_UPDATED, driverPayload);
+  emitToDriver(driver._id, S2C_EVENTS.BOOKING_UPDATED, driverPayload);
+  emitToAdmins(S2C_EVENTS.BOOKING_UPDATED, userPayload);
+
+  // Withdraw open inbox offers so other drivers drop the request.
+  for (const pendingId of previousPending) {
+    if (String(pendingId) === String(driver._id)) continue;
+    emitToDriver(pendingId, S2C_EVENTS.BOOKING_OFFER_WITHDRAWN, {
+      bookingId: String(updatedBooking._id),
+      reason: 'assigned_by_admin',
+    });
+  }
+
+  notifyDriverOrderAssigned(driver._id, updatedBooking).catch(() => null);
+
+  return {
+    booking: await Booking.findById(updatedBooking._id)
+      .populate('driverId', 'name phone email rating')
+      .populate('userId', 'name phone_no')
+      .lean(),
+    paid: updatedBooking.paymentStatus === BOOKING_PAYMENT_STATUS.PAID,
+    locked: lockNow,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Conflict probe (UI hover)                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Lightweight endpoint used by the UI to re-run the driver-conflict
+ * check for a specific (bookingId, driverId) pair WITHOUT committing
+ * anything — used to refresh the "no conflict" banner the moment a
+ * picker row is selected.
+ */
+export async function probeDriverConflictService(bookingId, driverId, staff) {
+  const detail = await getOutstationAssignmentDetailService(bookingId, staff);
+  if (!detail) throw new ApiError(404, 'Outstation booking not found or out of zone');
+  const { booking, bufferMinutes, window, vehicleConflicts } = detail;
+  if (!window) return { driverConflicts: [], vehicleConflicts: [] };
+
+  const map = await getDriverConflictMap({
+    driverIds: [driverId],
+    window: { startMs: window.bufferedStartMs, endMs: window.bufferedEndMs },
+    excludeBookingId: booking._id,
+    bufferMinutes,
+  });
+  return {
+    driverConflicts: map[String(driverId)] || [],
+    vehicleConflicts,
+    bufferMinutes,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Admin settle — arrived, no OTP                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * End an outstation booking stuck at ARRIVED (customer never gave OTP).
+ *
+ * Splits the prepaid fare:
+ *   platform keeps commission + platform fee (from fareSnapshot)
+ *   admin-entered amount → driver wallet
+ *   remainder → user wallet refund
+ *
+ * Does NOT call settleDriverEarning (that would pay the full trip fare).
+ * Hourly no-show auto-complete is untouched.
+ */
+export async function adminSettleOutstationArrivedService(
+  bookingId,
+  { driverPayoutRupees, notes = '', staffId = null, staff = null } = {},
+) {
+  if (!mongoose.isValidObjectId(bookingId)) {
+    throw new ApiError(400, 'Invalid booking id');
+  }
+
+  const payout = round2(Number(driverPayoutRupees));
+  if (!Number.isFinite(payout) || payout < 0) {
+    throw new ApiError(400, 'driverPayoutRupees must be a non-negative number');
+  }
+
+  // Zone scope for sub_admin / team_member (same gate as detail/assign).
+  if (staff && zoneScopeForStaff(staff) !== null) {
+    const detail = await getOutstationAssignmentDetailService(bookingId, staff);
+    if (!detail) {
+      throw new ApiError(404, 'Outstation booking not found or out of zone');
+    }
+  }
+
+  cancelNoShowSchedule(bookingId);
+
+  // Claim atomically so two admins cannot double-settle.
+  const booking = await Booking.findOneAndUpdate(
+    {
+      _id: bookingId,
+      serviceType: SERVICE_TYPES.OUTSTATION,
+      status: BOOKING_STATUS.ARRIVED,
+      isDeleted: false,
+      driverId: { $ne: null },
+      userId: { $ne: null },
+      'adminSettlement.settledAt': null,
+    },
+    {
+      $set: {
+        'adminSettlement.kind': 'outstation_arrived_no_otp',
+        'adminSettlement.settledAt': new Date(),
+        'adminSettlement.settledBy': staffId || null,
+      },
+    },
+    { new: true },
+  );
+
+  if (!booking) {
+    const existing = await Booking.findById(bookingId)
+      .select('serviceType status driverId userId adminSettlement')
+      .lean();
+    if (!existing || existing.serviceType !== SERVICE_TYPES.OUTSTATION) {
+      throw new ApiError(404, 'Outstation booking not found');
+    }
+    if (existing.adminSettlement?.settledAt) {
+      throw new ApiError(409, 'This booking has already been settled by admin');
+    }
+    if (existing.status !== BOOKING_STATUS.ARRIVED) {
+      throw new ApiError(
+        409,
+        `Only arrived outstation bookings can be settled (current: ${existing.status})`,
+      );
+    }
+    if (!existing.driverId || !existing.userId) {
+      throw new ApiError(409, 'Booking is missing driver or user — cannot settle');
+    }
+    throw new ApiError(409, 'Could not claim booking for settlement — retry');
+  }
+
+  const amountPaid = round2(
+    Number(booking.payment?.amountPaidRupees)
+      || Number(booking.fareSnapshot?.total)
+      || Number(booking.fareSnapshot?.breakdown?.totalPayable)
+      || 0,
+  );
+  const { commission, platformFee } = netPlatformRevenueFromFareSnapshot(
+    booking.fareSnapshot || {},
+  );
+  const platformKeep = round2(commission + platformFee);
+  const maxPayout = round2(Math.max(0, amountPaid - platformKeep));
+
+  if (payout > maxPayout + 0.001) {
+    // Roll back the claim stamp so another (valid) settle can proceed.
+    await Booking.updateOne(
+      { _id: booking._id },
+      {
+        $set: {
+          'adminSettlement.kind': '',
+          'adminSettlement.settledAt': null,
+          'adminSettlement.settledBy': null,
+        },
+      },
+    );
+    throw new ApiError(
+      422,
+      `Driver payout ₹${payout} exceeds max ₹${maxPayout} (paid ₹${amountPaid} − platform ₹${platformKeep})`,
+    );
+  }
+
+  const userRefund = round2(Math.max(0, amountPaid - platformKeep - payout));
+  const driverId = booking.driverId;
+  const userId = booking.userId;
+  const now = new Date();
+
+  let userRefundTxId = null;
+  try {
+    if (payout > 0) {
+      await creditDriverWalletService({
+        driverId,
+        amount: payout,
+        refundId: booking._id,
+        description: `Outstation settle ${booking.bookingNumber || booking._id} — admin payout`,
+        initiatedBy: staffId,
+      });
+    }
+    if (userRefund > 0) {
+      const txn = await creditWalletService({
+        userId,
+        amount: userRefund,
+        source: WALLET_TXN_SOURCE.BOOKING_REFUND,
+        description: `Outstation settle refund — ${booking.bookingNumber || booking._id}`,
+        refType: 'Booking',
+        refId: String(booking._id),
+        initiatedBy: staffId,
+      });
+      userRefundTxId = txn?._id || null;
+    }
+  } catch (moneyErr) {
+    await Booking.updateOne(
+      { _id: booking._id },
+      {
+        $set: {
+          'adminSettlement.kind': '',
+          'adminSettlement.settledAt': null,
+          'adminSettlement.settledBy': null,
+        },
+      },
+    );
+    throw moneyErr;
+  }
+
+  if (userRefund > 0) {
+    try {
+      await issueBookingRefundService(booking, {
+        initiatedBy: REFUND_INITIATED_BY.ADMIN,
+        reason: 'admin_outstation_settlement',
+        breakdown: {
+          amountRupees: userRefund,
+          cancellationFeeRupees: 0,
+          grossPaidRupees: amountPaid,
+        },
+        autoProcessed: true,
+        payoutMethod: REFUND_PAYOUT_METHOD.WALLET,
+        walletTxId: userRefundTxId,
+      });
+    } catch (ledgerErr) {
+      console.warn(
+        '[outstationSettle] refund ledger write failed:',
+        ledgerErr?.message,
+      );
+    }
+  }
+
+  // Release unused waiting hold (outstation is usually ₹0).
+  const bufferHold = round2(Number(booking.waiting?.bufferRupees) || 0);
+  if (bufferHold > 0) {
+    await releaseWalletHoldService({ userId, amount: bufferHold }).catch((err) =>
+      console.warn(
+        '[outstationSettle] failed to release waiting hold:',
+        err?.message,
+      ),
+    );
+  }
+
+  await clearPendingExtensionsOnTerminate(booking, 'admin_outstation_settlement').catch(
+    () => null,
+  );
+
+  // Record platform take while driverId is still on the booking.
+  await recordCompletedTripPlatformRevenue(booking, {
+    reason: 'admin_outstation_settlement',
+    adminSettlement: true,
+  }).catch((err) =>
+    console.warn('[outstationSettle] revenue write failed:', err?.message),
+  );
+
+  booking.status = BOOKING_STATUS.CANCELLED;
+  booking.timeline = booking.timeline || {};
+  booking.timeline.cancelledAt = now;
+  booking.cancellation = {
+    ...(booking.cancellation?.toObject?.() || booking.cancellation || {}),
+    reason: 'admin_outstation_settlement',
+    cancelledBy: 'admin',
+    feeCharged: 0,
+    refundAmount: userRefund,
+    driverShare: payout,
+    companyShare: platformKeep,
+    tier: 'outstation_arrived_no_otp',
+  };
+  booking.adminSettlement = {
+    kind: 'outstation_arrived_no_otp',
+    driverPayoutRupees: payout,
+    userRefundRupees: userRefund,
+    commissionKept: commission,
+    platformFeeKept: platformFee,
+    amountPaidRupees: amountPaid,
+    settledBy: staffId || null,
+    settledAt: now,
+    notes: notes ? String(notes).slice(0, 500) : '',
+    userRefundTxId,
+  };
+  booking.dispatch = booking.dispatch || {};
+  booking.dispatch.pendingOfferIds = [];
+  booking.dispatch.currentExpiresAt = null;
+  // Keep driverId for audit, but free the lock below. Match cancel paths
+  // that unlink so active-trip queries never keep matching this row.
+  const settledDriverId = driverId;
+  booking.driverId = null;
+  await booking.save();
+
+  await Driver.updateOne(
+    { _id: settledDriverId },
+    { $set: { isOnTrip: false } },
+  ).catch((err) =>
+    console.warn(
+      '[outstationSettle] failed to clear driver.isOnTrip:',
+      err?.message,
+    ),
+  );
+
+  const payload = {
+    bookingId: String(booking._id),
+    status: booking.status,
+    reason: 'admin_outstation_settlement',
+    adminSettlement: booking.adminSettlement,
+  };
+  emitToUser(userId, S2C_EVENTS.BOOKING_UPDATED, payload);
+  emitToBooking(booking._id, S2C_EVENTS.BOOKING_UPDATED, payload);
+  emitToDriver(settledDriverId, S2C_EVENTS.BOOKING_UPDATED, payload);
+  emitToAdmins(S2C_EVENTS.BOOKING_UPDATED, payload);
+
+  return {
+    booking: await Booking.findById(booking._id)
+      .populate('userId', 'name phone_no')
+      .lean(),
+    settlement: {
+      amountPaidRupees: amountPaid,
+      commissionKept: commission,
+      platformFeeKept: platformFee,
+      driverPayoutRupees: payout,
+      userRefundRupees: userRefund,
+    },
+  };
+}

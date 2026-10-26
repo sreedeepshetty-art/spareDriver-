@@ -1,0 +1,1539 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import toast from 'react-hot-toast';
+import {
+  Sparkles,
+  MapPin,
+  User as UserIcon,
+  Phone,
+  Search,
+  RefreshCw,
+  Loader2,
+  AlertTriangle,
+  ChevronDown,
+  UserCheck,
+  UserMinus,
+  Star,
+  CalendarRange,
+  Filter,
+  Car,
+  Eye,
+  UserPlus,
+  UserRoundCog,
+} from 'lucide-react';
+import Card from '../../../components/Card';
+import Button from '../../../components/Button';
+import Badge from '../../../components/Badge';
+import ConfirmDialog from '../../../components/ConfirmDialog';
+import Drawer from '../../../components/Drawer';
+import ServerPaginatedTable from '../components/ServerPaginatedTable';
+import RowActionsMenu from '../components/RowActionsMenu';
+import AdminTransactionFields, { EMPTY_TXN_FORM } from '../components/AdminTransactionFields';
+import api from '../../../utils/api';
+import useAdminAuthStore from '../../../store/useAdminAuthStore';
+import { useAdminZonesStore } from '../../../store/admin/useAdminZonesStore';
+import {
+  SUBSCRIPTION_ASSIGNMENT_STATUS,
+  SUBSCRIPTION_CANCEL_REQUEST_STATUS,
+  SUBSCRIPTION_STATUS,
+} from '../../../constants/serviceTypes';
+import { formatDateTime12 } from '../../../utils/datetime';
+import {
+  DriverCarExperienceChips,
+  formatCarLabel,
+} from '../components/DriverCarExperienceChips';
+import AdminDriverDetailModal from '../components/AdminDriverDetailModal';
+
+const OPERATIONS_ROLES = new Set(['admin', 'sub_admin']);
+
+const ASSIGNMENT_FILTERS = [
+  { value: '', label: 'All assignment statuses' },
+  { value: SUBSCRIPTION_ASSIGNMENT_STATUS.PENDING, label: 'Pending driver' },
+  { value: SUBSCRIPTION_ASSIGNMENT_STATUS.ASSIGNED, label: 'Driver assigned' },
+  { value: SUBSCRIPTION_ASSIGNMENT_STATUS.RELEASED, label: 'Released' },
+];
+
+const STATUS_FILTERS = [
+  { value: SUBSCRIPTION_STATUS.ACTIVE, label: 'Active' },
+  { value: SUBSCRIPTION_STATUS.EXPIRED, label: 'Expired' },
+  { value: SUBSCRIPTION_STATUS.CANCELLED, label: 'Cancelled' },
+  { value: 'all', label: 'All statuses' },
+];
+
+const CANCEL_REQUEST_FILTERS = [
+  { value: '', label: 'All cancel requests' },
+  { value: SUBSCRIPTION_CANCEL_REQUEST_STATUS.PENDING, label: 'Cancel requested' },
+];
+
+const EMPTY_FILTERS = {
+  search: '',
+  zoneId: '',
+  assignmentStatus: '',
+  status: SUBSCRIPTION_STATUS.ACTIVE,
+  cancelRequestStatus: '',
+  from: '',
+  to: '',
+};
+
+/** Pending + start calendar day already passed → admin needs to assign ASAP. */
+function isOverdueUnassignedSubscription(row) {
+  if (!row?.startDate) return false;
+  if (row.assignmentStatus !== SUBSCRIPTION_ASSIGNMENT_STATUS.PENDING) return false;
+  if (row.assignedDriverId) return false;
+  const start = new Date(row.startDate);
+  if (Number.isNaN(start.getTime())) return false;
+  start.setHours(0, 0, 0, 0);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return start.getTime() < today.getTime();
+}
+
+const ManageUserSubscriptions = () => {
+  const admin = useAdminAuthStore((s) => s.admin);
+  const canAssign = OPERATIONS_ROLES.has(admin?.role);
+
+  const fetchZones = useAdminZonesStore((s) => s.fetch);
+  const zonesEntry = useAdminZonesStore((s) => s.getEntry('admin-zones'));
+  const zones = useMemo(
+    () => (Array.isArray(zonesEntry?.data) ? zonesEntry.data : []),
+    [zonesEntry],
+  );
+
+  useEffect(() => {
+    fetchZones?.('admin-zones', {}).catch(() => {});
+  }, [fetchZones]);
+
+  const [page, setPage] = useState(1);
+  const [limit] = useState(10);
+  const [filters, setFilters] = useState(EMPTY_FILTERS);
+  const [searchInput, setSearchInput] = useState('');
+  const [rows, setRows] = useState([]);
+  const [pagination, setPagination] = useState({ total: 0, pages: 1 });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [assignRow, setAssignRow] = useState(null);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setFilters((f) => {
+        if (f.search === searchInput) return f;
+        setPage(1);
+        return { ...f, search: searchInput };
+      });
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchInput]);
+
+  const fetchQueue = useCallback(async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ page, limit });
+      if (filters.search) params.append('search', filters.search);
+      if (filters.zoneId) params.append('zoneId', filters.zoneId);
+      if (filters.assignmentStatus) params.append('assignmentStatus', filters.assignmentStatus);
+      if (filters.status) params.append('status', filters.status);
+      if (filters.cancelRequestStatus) {
+        params.append('cancelRequestStatus', filters.cancelRequestStatus);
+      }
+      if (filters.from) params.append('from', filters.from);
+      if (filters.to) params.append('to', filters.to);
+      const res = await api.get(`/admin/subscriptions/users?${params.toString()}`);
+      const data = res?.data?.data || {};
+      setRows(data.items || []);
+      setPagination({
+        total: data.total || 0,
+        pages: Math.max(1, Math.ceil((data.total || 0) / limit)),
+      });
+      setError(null);
+    } catch (err) {
+      setError(err?.response?.data?.message || 'Failed to load subscription requests');
+      setRows([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [page, limit, filters]);
+
+  const updateFilter = (key, value) => {
+    setFilters((f) => ({ ...f, [key]: value }));
+    setPage(1);
+  };
+
+  const clearFilters = () => {
+    setFilters(EMPTY_FILTERS);
+    setSearchInput('');
+    setPage(1);
+  };
+
+  const hasActiveFilters =
+    !!filters.search ||
+    !!filters.zoneId ||
+    !!filters.assignmentStatus ||
+    filters.status !== SUBSCRIPTION_STATUS.ACTIVE ||
+    !!filters.cancelRequestStatus ||
+    !!filters.from ||
+    !!filters.to;
+  const handleDrawerUpdated = useCallback((nextSub) => {
+    if (nextSub) setAssignRow(nextSub);
+    else setAssignRow(null);
+    fetchQueue();
+  }, [fetchQueue]);
+
+  useEffect(() => {
+    fetchQueue();
+  }, [fetchQueue]);
+
+  const pendingCount = useMemo(
+    () => rows.filter((r) => r.assignmentStatus === SUBSCRIPTION_ASSIGNMENT_STATUS.PENDING).length,
+    [rows],
+  );
+
+  const columns = useMemo(() => [
+    {
+      key: 'subscriptionNumber',
+      label: 'Subscription ID',
+      unclamp: true,
+      render: (_, row) => {
+        const cancelPending = row.cancellationRequest?.status === SUBSCRIPTION_CANCEL_REQUEST_STATUS.PENDING;
+        const variant =
+          row.assignmentStatus === SUBSCRIPTION_ASSIGNMENT_STATUS.ASSIGNED
+            ? 'success'
+            : row.assignmentStatus === SUBSCRIPTION_ASSIGNMENT_STATUS.RELEASED
+              ? 'default'
+              : 'warning';
+        const customerName = row.userId?.name || 'Unknown';
+
+        return (
+          <div className="min-w-0">
+            <div className="flex items-center justify-between gap-1.5 flex-wrap min-w-0">
+              <span className="text-xs font-mono font-bold text-slate-800 bg-slate-100 px-2 py-0.5 rounded">
+                {row.subscriptionNumber || '—'}
+              </span>
+              <div className="sm:hidden flex items-center gap-1">
+                <Badge variant={variant} className="text-[9px] px-1.5 py-0.5">{row.assignmentStatus || 'pending'}</Badge>
+                {cancelPending && <Badge variant="danger" className="text-[9px] px-1.5 py-0.5">Cancel requested</Badge>}
+              </div>
+            </div>
+            <div className="sm:hidden text-xs text-slate-800 mt-1 font-medium flex items-center justify-between gap-2">
+              <span className="truncate">Cust: {customerName}</span>
+              <span className="font-bold text-indigo-600 shrink-0">
+                ₹{row.amount} ({row.planNameSnapshot || row.planId?.name || '—'})
+              </span>
+            </div>
+            <div className="sm:hidden text-[10px] text-slate-500 mt-0.5 flex items-center justify-between gap-2">
+              <span className="truncate">Driver: {row.assignedDriverId?.name || 'Pending'}</span>
+              <span className="text-slate-400 shrink-0">
+                {row.startDate ? formatDateTime12(row.startDate) : '—'}
+              </span>
+            </div>
+          </div>
+        );
+      },
+    },
+    {
+      key: 'customer',
+      label: 'Customer',
+      className: 'hidden sm:table-cell',
+      render: (_, row) => (
+        <div className="min-w-0">
+          <p className="font-semibold text-slate-800 truncate">{row.userId?.name || '—'}</p>
+          <p className="text-xs text-slate-500">{row.userId?.phone_no || row.userId?.email || '—'}</p>
+        </div>
+      ),
+    },
+    {
+      key: 'plan',
+      label: 'Plan',
+      className: 'hidden sm:table-cell',
+      render: (_, row) => (
+        <div className="min-w-0">
+          <p className="font-medium text-slate-800">{row.planNameSnapshot || row.planId?.name || '—'}</p>
+          <p className="text-xs text-slate-500">
+            ₹{row.amount} · {row.durationMonths} mo
+            {row.includedHoursPerDay === 0
+              ? ' · full-time'
+              : ` · ${row.includedHoursPerDay}h/day`}
+          </p>
+        </div>
+      ),
+    },
+    {
+      key: 'car',
+      label: 'Car',
+      className: 'hidden md:table-cell',
+      render: (_, row) => (
+        <span className="inline-flex items-center gap-1 text-sm text-slate-600">
+          <Car className="w-3.5 h-3.5 shrink-0" />
+          <span className="truncate max-w-[140px]">{formatCarLabel(row.carId)}</span>
+        </span>
+      ),
+    },
+    {
+      key: 'zone',
+      label: 'Zone',
+      className: 'hidden md:table-cell',
+      render: (_, row) => (
+        <span className="inline-flex items-center gap-1 text-sm text-slate-600">
+          <MapPin className="w-3.5 h-3.5 shrink-0" />
+          {row.zoneId?.name || '—'}
+          {row.zoneId?.city ? ` · ${row.zoneId.city}` : ''}
+        </span>
+      ),
+    },
+    {
+      key: 'period',
+      label: 'Period',
+      className: 'hidden md:table-cell',
+      render: (_, row) => {
+        const overdue = isOverdueUnassignedSubscription(row);
+        return (
+          <div className="text-xs text-slate-600">
+            <p className={overdue ? 'font-semibold text-rose-700' : undefined}>
+              {row.startDate ? formatDateTime12(row.startDate) : '—'}
+            </p>
+            <p className="text-slate-400">to {row.expiryDate ? formatDateTime12(row.expiryDate) : '—'}</p>
+            {overdue && (
+              <Badge variant="danger" className="mt-1">Overdue</Badge>
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      key: 'driver',
+      label: 'Driver',
+      className: 'hidden sm:table-cell',
+      render: (_, row) => {
+        if (row.assignedDriverId) {
+          return (
+            <div className="min-w-0">
+              <p className="font-medium text-slate-800">{row.assignedDriverId.name}</p>
+              <p className="text-xs text-slate-500">{row.assignedDriverId.phone || '—'}</p>
+            </div>
+          );
+        }
+        return <Badge variant="warning">Pending</Badge>;
+      },
+    },
+    {
+      key: 'status',
+      label: 'Status',
+      className: 'hidden sm:table-cell',
+      render: (_, row) => {
+        const cancelPending =
+          row.cancellationRequest?.status === SUBSCRIPTION_CANCEL_REQUEST_STATUS.PENDING;
+        const variant =
+          row.assignmentStatus === SUBSCRIPTION_ASSIGNMENT_STATUS.ASSIGNED
+            ? 'success'
+            : row.assignmentStatus === SUBSCRIPTION_ASSIGNMENT_STATUS.RELEASED
+              ? 'default'
+              : 'warning';
+        return (
+          <div className="flex flex-col items-start gap-1">
+            <Badge variant={variant}>{row.assignmentStatus || 'pending'}</Badge>
+            {cancelPending && <Badge variant="danger">Cancel requested</Badge>}
+          </div>
+        );
+      },
+    },
+    {
+      key: 'inbox',
+      label: 'Inbox',
+      className: 'hidden md:table-cell',
+      render: (_, row) => (
+        <span className="text-xs text-slate-600">
+          {(row.dispatch?.pendingOfferIds || []).length}
+        </span>
+      ),
+    },
+    {
+      key: 'actions',
+      label: '',
+      width: '40px',
+      render: (_, row) => {
+        const items = [];
+        if (canAssign) {
+          items.push({
+            label: row.assignedDriverId ? 'Reassign' : 'Assign',
+            icon: row.assignedDriverId ? UserRoundCog : UserPlus,
+            onClick: () => setAssignRow(row),
+          });
+        } else {
+          items.push({
+            label: 'View',
+            icon: Eye,
+            onClick: () => setAssignRow(row),
+          });
+        }
+        return <RowActionsMenu items={items} />;
+      },
+    },
+  ], [canAssign]);
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-extrabold text-slate-900 flex items-center gap-2">
+            <Sparkles className="w-6 h-6 text-primary" />
+            Subscription Requests
+          </h1>
+          <p className="text-sm text-slate-500 mt-1">
+            Paid subscription bookings awaiting driver assignment, zone-wise. Drivers are matched to the customer&apos;s car type.
+          </p>
+        </div>
+        <Button variant="outline" onClick={fetchQueue} disabled={loading}>
+          <RefreshCw className={`w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
+          Refresh
+        </Button>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2 sm:gap-4">
+        <StatTile
+          label="Total (this page)"
+          value={rows.length}
+          desc="Active paid subscriptions"
+          icon={Sparkles}
+        />
+        <StatTile
+          label="Pending driver"
+          value={pendingCount}
+          desc="Need assignment on this page"
+          icon={UserCheck}
+          accent="amber"
+        />
+        <StatTile
+          label="All zones"
+          value={pagination.total}
+          desc="Matching current filters"
+          icon={CalendarRange}
+        />
+      </div>
+
+      <Card padding="p-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+          <div className="relative sm:col-span-2 lg:col-span-2 xl:col-span-2">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+            <input
+              type="text"
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+              placeholder="Search customer, phone, plan, or subscription ID"
+              className="w-full h-10 pl-9 pr-3 text-sm rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+            />
+          </div>
+          <div className="relative">
+            <Filter className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+            <select
+              value={filters.assignmentStatus}
+              onChange={(e) => updateFilter('assignmentStatus', e.target.value)}
+              className="w-full h-10 pl-9 pr-8 text-sm rounded-xl border border-slate-200 bg-white appearance-none focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+            >
+              {ASSIGNMENT_FILTERS.map((opt) => (
+                <option key={opt.value || 'all'} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+            <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+          </div>
+          <div className="relative">
+            <select
+              value={filters.status}
+              onChange={(e) => updateFilter('status', e.target.value)}
+              className="w-full h-10 px-3 pr-8 text-sm rounded-xl border border-slate-200 bg-white appearance-none focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+            >
+              {STATUS_FILTERS.map((opt) => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+            <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+          </div>
+          <div className="relative">
+            <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+            <select
+              value={filters.zoneId}
+              onChange={(e) => updateFilter('zoneId', e.target.value)}
+              className="w-full h-10 pl-9 pr-8 text-sm rounded-xl border border-slate-200 bg-white appearance-none focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+            >
+              <option value="">All zones</option>
+              {zones.map((z) => (
+                <option key={z._id} value={z._id}>
+                  {z.name}{z.city ? ` · ${z.city}` : ''}
+                </option>
+              ))}
+            </select>
+            <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+          </div>
+          <div className="relative">
+            <select
+              value={filters.cancelRequestStatus}
+              onChange={(e) => updateFilter('cancelRequestStatus', e.target.value)}
+              className="w-full h-10 px-3 pr-8 text-sm rounded-xl border border-slate-200 bg-white appearance-none focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+            >
+              {CANCEL_REQUEST_FILTERS.map((opt) => (
+                <option key={opt.value || 'all'} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+            <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
+          </div>
+          <input
+            type="date"
+            value={filters.from}
+            onChange={(e) => updateFilter('from', e.target.value)}
+            aria-label="Paid from date"
+            title="Paid from"
+            className="w-full h-10 px-3 text-sm rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+          />
+          <input
+            type="date"
+            value={filters.to}
+            onChange={(e) => updateFilter('to', e.target.value)}
+            aria-label="Paid to date"
+            title="Paid to"
+            className="w-full h-10 px-3 text-sm rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+          />
+        </div>
+        {hasActiveFilters && (
+          <div className="mt-3 flex justify-end">
+            <button
+              type="button"
+              onClick={clearFilters}
+              className="text-xs font-semibold text-slate-500 hover:text-slate-800"
+            >
+              Clear filters
+            </button>
+          </div>
+        )}
+      </Card>
+
+      {error && (
+        <div className="p-4 bg-rose-50 border border-rose-100 rounded-2xl text-rose-600 text-sm flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          {error}
+        </div>
+      )}
+
+      <ServerPaginatedTable
+        minWidth="w-full min-w-0"
+        columns={columns}
+        data={rows}
+        loading={loading}
+        page={page}
+        limit={limit}
+        pagination={pagination}
+        onPageChange={setPage}
+        onRowClick={canAssign ? (row) => setAssignRow(row) : undefined}
+        getRowClassName={(row) =>
+          isOverdueUnassignedSubscription(row)
+            ? '!bg-rose-50 hover:!bg-rose-100/80'
+            : ''
+        }
+        entityLabel="subscriptions"
+        emptyMessage="No subscription requests match these filters."
+      />
+
+      {assignRow && (
+        <AssignSubscriptionDrawer
+          subscription={assignRow}
+          onClose={() => setAssignRow(null)}
+          onUpdated={handleDrawerUpdated}
+        />
+      )}
+    </div>
+  );
+};
+
+function StatTile({ label, value, desc, icon: Icon, accent }) {
+  const accentClass = accent === 'amber' ? 'text-amber-600 bg-amber-100' : 'text-primary bg-primary/15';
+  return (
+    <div className="bg-white rounded-xl sm:rounded-2xl border border-slate-100 shadow-sm p-3 sm:p-5 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4">
+      <div className={`w-8 h-8 sm:w-12 sm:h-12 rounded-xl sm:rounded-2xl flex items-center justify-center shrink-0 ${accentClass}`}>
+        <Icon className="w-4 h-4 sm:w-6 sm:h-6" />
+      </div>
+      <div>
+        <p className="text-xl sm:text-3xl font-extrabold text-slate-900 leading-none">{value}</p>
+        <p className="text-[10px] sm:text-[11px] font-bold text-slate-600 mt-0.5 sm:mt-1 leading-tight">{label}</p>
+        <p className="hidden sm:block text-[10px] text-slate-400 mt-0.5">{desc}</p>
+      </div>
+    </div>
+  );
+}
+
+function toDateInputValue(d) {
+  if (!d) return '';
+  const x = new Date(d);
+  if (Number.isNaN(x.getTime())) return '';
+  const y = x.getFullYear();
+  const m = String(x.getMonth() + 1).padStart(2, '0');
+  const day = String(x.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function todayInputValue() {
+  return toDateInputValue(new Date());
+}
+
+function addMonthsToDate(dateInput, months) {
+  const d = new Date(`${dateInput}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return null;
+  d.setMonth(d.getMonth() + Math.max(1, Number(months) || 1));
+  return d;
+}
+
+function AssignSubscriptionDrawer({ subscription, onClose, onUpdated }) {
+  const [drivers, setDrivers] = useState([]);
+  const [driversLoading, setDriversLoading] = useState(true);
+  const [driversError, setDriversError] = useState(null);
+  const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [driverFilters, setDriverFilters] = useState({
+    carTypeMatch: 'true',
+    zoneMatch: 'true',
+    minRating: '',
+    onlineOnly: false,
+    allIndiaOnly: false,
+    minDrivingHoursPerDay: '',
+  });
+  const [detailDriver, setDetailDriver] = useState(null);
+  const [selectedDriverId, setSelectedDriverId] = useState(null);
+  const [releaseReason, setReleaseReason] = useState('');
+  const [workingStartDate, setWorkingStartDate] = useState(() => todayInputValue());
+  const [workingEndDate, setWorkingEndDate] = useState('');
+  const [previousDriverLastWorkingDate, setPreviousDriverLastWorkingDate] = useState(() => todayInputValue());
+  const [releaseLastWorkingDate, setReleaseLastWorkingDate] = useState(() => todayInputValue());
+  const [subscriptionStatusDraft, setSubscriptionStatusDraft] = useState(subscription.status || '');
+  const [subscriptionStatusReason, setSubscriptionStatusReason] = useState('');
+  const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
+  const [settlementConfirmed, setSettlementConfirmed] = useState(false);
+  const [refundTxnForm, setRefundTxnForm] = useState(EMPTY_TXN_FORM);
+  const [approveCancelOpen, setApproveCancelOpen] = useState(false);
+  const [rejectNote, setRejectNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const cancelRequestPending =
+    subscription.cancellationRequest?.status === SUBSCRIPTION_CANCEL_REQUEST_STATUS.PENDING;
+  const refundAmountRupees = Number(subscription.amount) || 0;
+  const refundDetailsRequired = refundAmountRupees > 0;
+  const refundDetailsReady =
+    !refundDetailsRequired
+    || Boolean(refundTxnForm.transactionId?.trim() || refundTxnForm.utr?.trim());
+  const [periodStartDraft, setPeriodStartDraft] = useState(() => toDateInputValue(subscription.startDate));
+  const [periodSaving, setPeriodSaving] = useState(false);
+  const searchRef = useRef(null);
+
+  const subscriptionPeriodLabel = useMemo(() => {
+    const start = toDateInputValue(subscription.startDate);
+    const end = toDateInputValue(subscription.expiryDate);
+    if (!start || !end) return '—';
+    return `${start} → ${end}`;
+  }, [subscription.startDate, subscription.expiryDate]);
+
+  const periodPreviewExpiry = useMemo(() => {
+    if (!periodStartDraft) return '';
+    return toDateInputValue(addMonthsToDate(periodStartDraft, subscription.durationMonths));
+  }, [periodStartDraft, subscription.durationMonths]);
+
+  const periodDirty = periodStartDraft !== toDateInputValue(subscription.startDate);
+
+  useEffect(() => {
+    setPeriodStartDraft(toDateInputValue(subscription.startDate));
+    setSubscriptionStatusDraft(subscription.status || '');
+    setWorkingStartDate(todayInputValue());
+    setWorkingEndDate('');
+    setPreviousDriverLastWorkingDate(todayInputValue());
+    setReleaseLastWorkingDate(todayInputValue());
+  }, [
+    subscription._id,
+    subscription.startDate,
+    subscription.expiryDate,
+    subscription.status,
+  ]);
+
+  useEffect(() => {
+    const id = setTimeout(() => setDebouncedSearch(search), 250);
+    return () => clearTimeout(id);
+  }, [search]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setDriversLoading(true);
+    setDrivers([]);
+    const params = new URLSearchParams({ limit: 50, page: 1 });
+    if (debouncedSearch) params.append('search', debouncedSearch);
+    if (driverFilters.carTypeMatch) params.append('carTypeMatch', driverFilters.carTypeMatch);
+    if (driverFilters.zoneMatch) params.append('zoneMatch', driverFilters.zoneMatch);
+    if (driverFilters.minRating) params.append('minRating', driverFilters.minRating);
+    if (driverFilters.onlineOnly) params.append('onlineOnly', 'true');
+    if (driverFilters.allIndiaOnly) params.append('allIndiaOnly', 'true');
+    if (driverFilters.minDrivingHoursPerDay) {
+      params.append('minDrivingHoursPerDay', driverFilters.minDrivingHoursPerDay);
+    }
+    api
+      .get(`/admin/subscriptions/users/${subscription._id}/available-drivers?${params}`)
+      .then((res) => {
+        if (!cancelled) {
+          const data = res?.data?.data || {};
+          setDrivers(data.drivers || []);
+          setDriversError(null);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setDriversError(err?.response?.data?.message || 'Failed to load drivers');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setDriversLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [subscription._id, debouncedSearch, driverFilters]);
+
+  const selectedDriver = useMemo(
+    () => drivers.find((d) => String(d._id) === String(selectedDriverId)) || null,
+    [drivers, selectedDriverId],
+  );
+
+  const isSameAsCurrentDriver = Boolean(
+    subscription.assignedDriverId
+    && selectedDriverId
+    && String(subscription.assignedDriverId._id || subscription.assignedDriverId)
+      === String(selectedDriverId),
+  );
+
+  const handleAssign = async () => {
+    if (!selectedDriverId) {
+      toast.error('Pick a driver first');
+      return;
+    }
+    if (isSameAsCurrentDriver) {
+      toast.error(
+        'This driver is already assigned. Release them first before reassigning.',
+      );
+      return;
+    }
+    if (!workingStartDate) {
+      toast.error('Working start date is required');
+      return;
+    }
+    if (subscription.assignedDriverId && !previousDriverLastWorkingDate) {
+      toast.error('Previous driver last working date is required for reassignment');
+      return;
+    }
+    if (selectedDriver?.hasConflict) {
+      toast.error('This driver has a scheduling conflict. Pick another.');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const res = await api.post(`/admin/subscriptions/users/${subscription._id}/assign`, {
+        driverId: selectedDriverId,
+        workingStartDate,
+        workingEndDate: workingEndDate || undefined,
+        previousDriverLastWorkingDate: subscription.assignedDriverId
+          ? previousDriverLastWorkingDate
+          : undefined,
+      });
+      const emailStatus = res?.data?.data?.assignmentEmail;
+      if (emailStatus?.sent) {
+        toast.success(
+          `Driver assigned — confirmation email sent to ${emailStatus.to}`,
+        );
+      } else if (emailStatus?.reason === 'no_email') {
+        toast.success('Driver assigned — customer has no registered email on file');
+      } else {
+        toast.success('Driver assigned successfully');
+        if (emailStatus?.reason) {
+          toast.error(`Could not send assignment email: ${emailStatus.reason}`);
+        }
+      }
+      onUpdated();
+    } catch (err) {
+      const data = err?.response?.data;
+      toast.error(data?.message || 'Could not assign driver');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleSubscriptionStatusUpdate = async () => {
+    if (!subscriptionStatusDraft || subscriptionStatusDraft === subscription.status) {
+      toast.error('Pick a different status');
+      return;
+    }
+    if (subscriptionStatusDraft === SUBSCRIPTION_STATUS.CANCELLED) {
+      setCancelConfirmOpen(true);
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api.patch(`/admin/subscriptions/users/${subscription._id}/status`, {
+        status: subscriptionStatusDraft,
+        reason: subscriptionStatusReason.trim() || undefined,
+      });
+      toast.success('Subscription status updated');
+      onUpdated();
+    } catch (err) {
+      toast.error(err?.response?.data?.message || 'Could not update subscription status');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleReschedulePeriod = async () => {
+    if (!periodStartDraft || periodSaving || !periodDirty) return;
+    setPeriodSaving(true);
+    try {
+      const res = await api.post(
+        `/admin/subscriptions/users/${subscription._id}/reschedule`,
+        { startDate: new Date(`${periodStartDraft}T00:00:00`).toISOString() },
+      );
+      const updated = res?.data?.data || null;
+      toast.success('Subscription period updated');
+      onUpdated(updated);
+    } catch (err) {
+      toast.error(err?.response?.data?.message || 'Could not update period');
+    } finally {
+      setPeriodSaving(false);
+    }
+  };
+
+  const resetCancelForms = () => {
+    setSettlementConfirmed(false);
+    setRefundTxnForm(EMPTY_TXN_FORM);
+  };
+
+  const buildRefundPayload = () => {
+    if (!refundDetailsRequired) return null;
+    return {
+      mode: refundTxnForm.mode.trim(),
+      transactionId: refundTxnForm.transactionId.trim(),
+      utr: refundTxnForm.utr.trim(),
+      referenceNumber: refundTxnForm.referenceNumber.trim(),
+      notes: refundTxnForm.notes.trim(),
+    };
+  };
+
+  const handleCancelSubscription = async () => {
+    if (!settlementConfirmed || !refundDetailsReady) return;
+    if (refundDetailsRequired && !refundTxnForm.transactionId?.trim() && !refundTxnForm.utr?.trim()) {
+      toast.error('Transaction ID or UTR is required for the refund');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api.patch(`/admin/subscriptions/users/${subscription._id}/status`, {
+        status: SUBSCRIPTION_STATUS.CANCELLED,
+        reason: subscriptionStatusReason.trim() || 'Cancelled by admin',
+        settlementConfirmed: true,
+        createRefund: refundDetailsRequired,
+        transactionDetails: buildRefundPayload(),
+      });
+      toast.success(
+        refundDetailsRequired
+          ? 'Subscription cancelled — refund recorded'
+          : 'Subscription cancelled',
+      );
+      setCancelConfirmOpen(false);
+      resetCancelForms();
+      onUpdated();
+    } catch (err) {
+      toast.error(err?.response?.data?.message || 'Could not cancel subscription');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleApproveCancelRequest = async () => {
+    if (!settlementConfirmed || !refundDetailsReady) return;
+    if (refundDetailsRequired && !refundTxnForm.transactionId?.trim() && !refundTxnForm.utr?.trim()) {
+      toast.error('Transaction ID or UTR is required for the refund');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api.post(`/admin/subscriptions/users/${subscription._id}/cancel-request/review`, {
+        action: 'approve',
+        reviewNote: rejectNote.trim() || subscriptionStatusReason.trim() || undefined,
+        settlementConfirmed: true,
+        createRefund: refundDetailsRequired,
+        transactionDetails: buildRefundPayload(),
+      });
+      toast.success(
+        refundDetailsRequired
+          ? 'Cancellation approved — refund recorded'
+          : 'Cancellation approved',
+      );
+      setApproveCancelOpen(false);
+      resetCancelForms();
+      onUpdated();
+    } catch (err) {
+      toast.error(err?.response?.data?.message || 'Could not approve cancellation');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleRejectCancelRequest = async () => {
+    const reason = rejectNote.trim() || subscriptionStatusReason.trim();
+    if (reason.length < 3) {
+      toast.error('Rejection reason is required');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api.post(`/admin/subscriptions/users/${subscription._id}/cancel-request/review`, {
+        action: 'reject',
+        reviewNote: reason,
+      });
+      toast.success('Cancellation rejected — customer emailed');
+      setRejectNote('');
+      onUpdated();
+    } catch (err) {
+      toast.error(err?.response?.data?.message || 'Could not reject cancellation request');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const driverSharePool = Number(subscription.driverShareRupees) || 0;
+  const recordedDriverPayouts = Array.isArray(subscription.driverPayouts)
+    ? subscription.driverPayouts.reduce(
+        (sum, payout) => sum + (Number(payout.amountRupees) || 0),
+        0,
+      )
+    : 0;
+  const paidToDrivers =
+    recordedDriverPayouts > 0 || !subscription.driverSharePaidAt
+      ? recordedDriverPayouts
+      : driverSharePool;
+  const remainingDriverShare = Math.max(0, driverSharePool - paidToDrivers);
+
+  const handleRelease = async () => {
+    if (!subscription.assignedDriverId) return;
+    if (!releaseLastWorkingDate) {
+      toast.error('Last working date is required');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api.post(`/admin/subscriptions/users/${subscription._id}/release`, {
+        reason: releaseReason.trim() || 'Released by admin',
+        lastWorkingDate: releaseLastWorkingDate,
+      });
+      toast.success('Driver released');
+      onUpdated();
+    } catch (err) {
+      toast.error(err?.response?.data?.message || 'Could not release driver');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Drawer
+      isOpen
+      onClose={() => !submitting && !cancelConfirmOpen && !approveCancelOpen && onClose()}
+      header={(
+        <div className="px-5 py-4 border-b border-slate-100">
+          <h2 className="text-lg font-bold text-slate-900">Assign dedicated driver</h2>
+          <p className="text-xs text-slate-500 mt-0.5">
+            {subscription.planNameSnapshot || subscription.planId?.name || 'Subscription'}
+          </p>
+        </div>
+      )}
+    >
+      <div className="p-5 space-y-4">
+        {cancelRequestPending && (
+          <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 space-y-3">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+              <div>
+                <p className="text-sm font-bold text-rose-900">Customer cancellation request</p>
+                <p className="text-xs text-rose-800 mt-1">
+                  {subscription.cancellationRequest?.reason
+                    ? `Reason: ${subscription.cancellationRequest.reason}`
+                    : 'No reason provided.'}
+                </p>
+                {subscription.cancellationRequest?.requestedAt && (
+                  <p className="text-[11px] text-rose-700 mt-1">
+                    Requested {formatDateTime12(subscription.cancellationRequest.requestedAt)}
+                  </p>
+                )}
+              </div>
+            </div>
+            <p className="text-xs text-rose-800">
+              Approve requires bank refund details, then cancels the subscription.
+              Reject keeps it active. Driver assignment is blocked while this request is pending.
+            </p>
+            <div>
+              <label className="text-xs font-semibold text-slate-600">
+                Review note <span className="text-rose-600">*</span>
+                {' '}
+                <span className="font-normal text-slate-500">(required to reject — emailed to customer)</span>
+              </label>
+              <textarea
+                value={rejectNote}
+                onChange={(e) => setRejectNote(e.target.value)}
+                placeholder="Reason of rejection / note for approve"
+                rows={2}
+                className="mt-1 w-full px-3 py-2 rounded-xl border border-rose-200 text-sm bg-white resize-none"
+              />
+            </div>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={submitting}
+                onClick={handleRejectCancelRequest}
+              >
+                Reject request
+              </Button>
+              <Button
+                type="button"
+                disabled={submitting}
+                onClick={() => {
+                  resetCancelForms();
+                  setApproveCancelOpen(true);
+                }}
+              >
+                Approve &amp; cancel
+              </Button>
+            </div>
+          </div>
+        )}
+
+        <div className="rounded-2xl bg-slate-50 p-4 text-sm space-y-3">
+          <p className="text-xs font-bold uppercase tracking-wide text-slate-500">Subscription details</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-slate-700">
+            <DetailLine label="Subscription ID" value={subscription.subscriptionNumber || '—'} />
+            <DetailLine label="Customer" value={subscription.userId?.name || '—'} />
+            <DetailLine label="Plan" value={subscription.planNameSnapshot || subscription.planId?.name || '—'} />
+            <DetailLine label="Zone" value={`${subscription.zoneId?.name || '—'}${subscription.zoneId?.city ? ` · ${subscription.zoneId.city}` : ''}`} />
+            <DetailLine label="Car" value={formatCarLabel(subscription.carId)} />
+            <DetailLine
+              label="Driver hours"
+              value={subscription.includedHoursPerDay === 0 ? 'Full-time' : `${subscription.includedHoursPerDay}h/day`}
+            />
+            <DetailLine label="Duration" value={`${subscription.durationMonths} month(s)`} />
+            <DetailLine label="Subscription period" value={subscriptionPeriodLabel} />
+          </div>
+          {(subscription.dailyPickup || subscription.dailyDropoff) && (
+            <div className="pt-2 border-t border-slate-200 space-y-1.5">
+              <DetailLine
+                label="Daily pickup"
+                value={subscription.dailyPickup?.address || '—'}
+              />
+              <DetailLine
+                label="Daily drop-off"
+                value={subscription.dailyDropoff?.address || '—'}
+              />
+            </div>
+          )}
+          {subscription.assignedDriverId && (
+            <div className="flex items-center gap-2 text-emerald-700 pt-1">
+              <UserCheck className="w-4 h-4" />
+              Current: {subscription.assignedDriverId.name}
+            </div>
+          )}
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 p-4 space-y-3">
+          <p className="text-xs font-bold uppercase tracking-wide text-slate-500 flex items-center gap-1.5">
+            <CalendarRange className="w-3.5 h-3.5" />
+            Change subscription period
+          </p>
+          <p className="text-xs text-slate-500">
+            {subscription.assignedDriverId
+              ? 'After a driver is assigned, only admin can move the start date. End date shifts to keep the same plan length; the driver working window is adjusted if needed.'
+              : 'Move the start date before assignment. End date shifts to keep the same plan length. Customers can also do this from their app while pending.'}
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs font-semibold text-slate-600">
+                Start date <span className="text-rose-500">*</span>
+              </label>
+              <input
+                type="date"
+                value={periodStartDraft}
+                onChange={(e) => setPeriodStartDraft(e.target.value)}
+                disabled={subscription.status !== SUBSCRIPTION_STATUS.ACTIVE || periodSaving}
+                className="mt-1 w-full h-10 px-3 rounded-xl border border-slate-200 text-sm disabled:bg-slate-50"
+              />
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-slate-600">
+                End date (auto)
+              </label>
+              <input
+                type="date"
+                value={periodPreviewExpiry}
+                readOnly
+                className="mt-1 w-full h-10 px-3 rounded-xl border border-slate-200 text-sm bg-slate-50 text-slate-600"
+              />
+            </div>
+          </div>
+          <Button
+            type="button"
+            size="sm"
+            disabled={
+              submitting
+              || periodSaving
+              || !periodDirty
+              || !periodStartDraft
+              || subscription.status !== SUBSCRIPTION_STATUS.ACTIVE
+            }
+            onClick={handleReschedulePeriod}
+          >
+            {periodSaving ? 'Saving…' : 'Save period'}
+          </Button>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 p-4 space-y-3">
+          <p className="text-xs font-bold uppercase tracking-wide text-slate-500">
+            Subscription status
+          </p>
+          <p className="text-xs text-slate-500">
+            Cancel or expire to unblock account deletion requests.
+          </p>
+          <div className="flex flex-col sm:flex-row gap-2">
+            <select
+              value={subscriptionStatusDraft}
+              onChange={(e) => setSubscriptionStatusDraft(e.target.value)}
+              className="flex-1 h-10 px-3 rounded-xl border border-slate-200 text-sm bg-white"
+            >
+              {[
+                SUBSCRIPTION_STATUS.ACTIVE,
+                SUBSCRIPTION_STATUS.EXPIRED,
+                SUBSCRIPTION_STATUS.CANCELLED,
+              ].map((s) => (
+                <option key={s} value={s}>
+                  {s.replace(/_/g, ' ')}
+                </option>
+              ))}
+            </select>
+            <input
+              value={subscriptionStatusReason}
+              onChange={(e) => setSubscriptionStatusReason(e.target.value)}
+              placeholder="Reason (optional)"
+              className="flex-1 h-10 px-3 rounded-xl border border-slate-200 text-sm"
+            />
+            <Button
+              type="button"
+              onClick={handleSubscriptionStatusUpdate}
+              disabled={submitting || subscriptionStatusDraft === subscription.status}
+            >
+              Update status
+            </Button>
+          </div>
+        </div>
+
+        {subscription.assignedDriverId && (
+          <div className="rounded-2xl border border-amber-200 bg-amber-50/50 p-4 space-y-3">
+            <p className="text-xs font-bold uppercase tracking-wide text-amber-800">
+              Release current driver
+            </p>
+            <div>
+              <label className="text-xs font-semibold text-slate-600">
+                Last working day <span className="text-rose-500">*</span>
+              </label>
+              <input
+                type="date"
+                value={releaseLastWorkingDate}
+                min={toDateInputValue(subscription.assignedAt || subscription.startDate)}
+                max={toDateInputValue(subscription.expiryDate)}
+                onChange={(e) => setReleaseLastWorkingDate(e.target.value)}
+                className="mt-1 w-full h-10 px-3 rounded-xl border border-slate-200 text-sm"
+              />
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                Release reason (optional)
+              </label>
+              <textarea
+                value={releaseReason}
+                onChange={(e) => setReleaseReason(e.target.value)}
+                rows={2}
+                placeholder="e.g. Driver on leave for 3 days"
+                className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+              />
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={submitting}
+              onClick={handleRelease}
+            >
+              <UserMinus className="w-4 h-4 mr-1" />
+              Release current driver
+            </Button>
+          </div>
+        )}
+
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 space-y-3">
+          <p className="text-xs font-bold uppercase tracking-wide text-slate-500">
+            {subscription.assignedDriverId ? 'New driver working period' : 'Driver working period'}
+          </p>
+          {subscription.assignedDriverId && (
+            <div>
+              <label className="text-xs font-semibold text-slate-600">
+                Previous driver last working day <span className="text-rose-500">*</span>
+              </label>
+              <input
+                type="date"
+                value={previousDriverLastWorkingDate}
+                min={toDateInputValue(subscription.assignedAt || subscription.startDate)}
+                max={toDateInputValue(subscription.expiryDate)}
+                onChange={(e) => setPreviousDriverLastWorkingDate(e.target.value)}
+                className="mt-1 w-full h-10 px-3 rounded-xl border border-slate-200 text-sm"
+              />
+              <p className="text-[10px] text-slate-500 mt-1">
+                Required when reassigning — closes the current driver&apos;s stint.
+              </p>
+            </div>
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs font-semibold text-slate-600">
+                Start date <span className="text-rose-500">*</span>
+              </label>
+              <input
+                type="date"
+                value={workingStartDate}
+                min={toDateInputValue(subscription.startDate)}
+                max={toDateInputValue(subscription.expiryDate)}
+                onChange={(e) => setWorkingStartDate(e.target.value)}
+                className="mt-1 w-full h-10 px-3 rounded-xl border border-slate-200 text-sm"
+              />
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-slate-600">
+                End date <span className="text-slate-400">(optional)</span>
+              </label>
+              <input
+                type="date"
+                value={workingEndDate}
+                min={workingStartDate || toDateInputValue(subscription.startDate)}
+                max={toDateInputValue(subscription.expiryDate)}
+                onChange={(e) => setWorkingEndDate(e.target.value)}
+                className="mt-1 w-full h-10 px-3 rounded-xl border border-slate-200 text-sm"
+              />
+              <p className="text-[10px] text-slate-500 mt-1">
+                Defaults to subscription end ({toDateInputValue(subscription.expiryDate)}).
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <DriverFilterBar filters={driverFilters} onChange={setDriverFilters} />
+
+        <div className="relative">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+          <input
+            ref={searchRef}
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search drivers by name or phone"
+            className="w-full h-10 pl-10 pr-4 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+          />
+        </div>
+
+        {driversError && (
+          <p className="text-sm text-rose-600">{driversError}</p>
+        )}
+
+        <div className="max-h-72 overflow-y-auto space-y-2">
+          {driversLoading ? (
+            <div className="flex justify-center py-8">
+              <Loader2 className="w-5 h-5 animate-spin text-slate-400" />
+            </div>
+          ) : drivers.length === 0 ? (
+            <p className="text-sm text-slate-500 text-center py-6">No drivers found.</p>
+          ) : (
+            drivers.map((driver) => {
+              const active = String(selectedDriverId) === String(driver._id);
+              return (
+                <button
+                  key={driver._id}
+                  type="button"
+                  disabled={driver.hasConflict}
+                  onClick={() => setSelectedDriverId(driver._id)}
+                  className={`w-full text-left p-3 rounded-xl border transition-all ${
+                    driver.hasConflict
+                      ? 'border-rose-100 bg-rose-50/50 opacity-70 cursor-not-allowed'
+                      : active
+                        ? 'border-primary bg-primary/5 ring-2 ring-primary/20'
+                        : 'border-slate-200 bg-white hover:border-primary/30'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <p className="font-semibold text-slate-800 truncate">{driver.name}</p>
+                        {driver.inSubscriptionZone ? (
+                          <span className="text-[9px] font-bold text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded-full">
+                            In zone ✓
+                          </span>
+                        ) : (
+                          <span className="text-[9px] font-bold text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded-full">
+                            Outside zone
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-slate-500 flex items-center gap-1 mt-0.5">
+                        <Phone className="w-3 h-3" />
+                        {driver.phone || '—'}
+                      </p>
+                    </div>
+                    <div className="flex flex-col items-end gap-1 shrink-0">
+                      <div className="flex items-center gap-1 text-xs text-amber-600">
+                        <Star className="w-3 h-3 fill-current" />
+                        {Number(driver.rating || 0).toFixed(1)}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDetailDriver(driver);
+                        }}
+                        className="text-[10px] font-bold text-primary hover:underline"
+                      >
+                        View detail
+                      </button>
+                    </div>
+                  </div>
+                  <DriverCarExperienceChips
+                    experience={driver.carTypeExperience}
+                    className="mt-2"
+                  />
+                  {(driver.outstationAllIndiaOk || driver.outstationMaxDrivingHoursPerDay) && (
+                    <p className="text-[10px] text-slate-500 mt-1">
+                      {driver.outstationAllIndiaOk ? 'All-India OK' : 'Zone-limited'}
+                      {driver.outstationMaxDrivingHoursPerDay
+                        ? ` · ${driver.outstationMaxDrivingHoursPerDay}h/day capacity`
+                        : ''}
+                    </p>
+                  )}
+                  {driver.hasConflict && (
+                    <p className="text-[10px] text-rose-600 mt-2 font-medium">
+                      {driver.hasSubscriptionConflict
+                        ? 'Already on another subscription in this period'
+                        : `Overlapping booking${driver.conflicts?.length === 1 ? '' : 's'}`}
+                    </p>
+                  )}
+                </button>
+              );
+            })
+          )}
+        </div>
+
+        {selectedDriver && (
+          <div className="rounded-xl bg-primary/5 border border-primary/20 p-3 text-sm">
+            <p className="font-semibold text-slate-800">Selected: {selectedDriver.name}</p>
+            <p className="text-xs text-slate-500 mt-1">{selectedDriver.phone || '—'}</p>
+            <DriverCarExperienceChips experience={selectedDriver.carTypeExperience} className="mt-2" />
+            {isSameAsCurrentDriver && (
+              <p className="text-xs text-amber-700 mt-2 font-medium">
+                This driver is already assigned. Release them first before reassigning.
+              </p>
+            )}
+          </div>
+        )}
+
+        <Button
+          fullWidth
+          disabled={
+            !selectedDriverId
+            || submitting
+            || selectedDriver?.hasConflict
+            || isSameAsCurrentDriver
+          }
+          onClick={handleAssign}
+        >
+          {submitting ? (
+            <span className="inline-flex items-center gap-2">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Assigning…
+            </span>
+          ) : (
+            subscription.assignedDriverId ? 'Reassign driver' : 'Assign driver'
+          )}
+        </Button>
+      </div>
+
+      <AdminDriverDetailModal
+        driver={detailDriver}
+        subscriptionZone={subscription.zoneId}
+        open={Boolean(detailDriver)}
+        onClose={() => setDetailDriver(null)}
+      />
+      <ConfirmDialog
+        open={cancelConfirmOpen}
+        onClose={() => {
+          if (!submitting) {
+            setCancelConfirmOpen(false);
+            resetCancelForms();
+          }
+        }}
+        onConfirm={handleCancelSubscription}
+        title="Cancel this subscription?"
+        description="Enter bank refund details first, then confirm settlement. Cancellation releases the assigned driver and cannot be undone."
+        confirmLabel="Cancel subscription"
+        variant="danger"
+        loading={submitting}
+        confirmDisabled={!settlementConfirmed || !refundDetailsReady}
+      >
+        <div className="space-y-3">
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-1">
+            <div className="flex justify-between gap-3">
+              <span>Driver payout pool</span>
+              <span className="font-semibold">₹{driverSharePool.toLocaleString('en-IN')}</span>
+            </div>
+            <div className="flex justify-between gap-3">
+              <span>Recorded paid</span>
+              <span className="font-semibold">₹{paidToDrivers.toLocaleString('en-IN')}</span>
+            </div>
+            <div className="flex justify-between gap-3 text-amber-700">
+              <span>Remaining pool</span>
+              <span className="font-semibold">₹{remainingDriverShare.toLocaleString('en-IN')}</span>
+            </div>
+          </div>
+          {refundDetailsRequired ? (
+            <div className="rounded-xl border border-slate-200 bg-white p-3 space-y-2">
+              <p className="text-xs font-semibold text-slate-700">
+                Bank refund details for ₹{refundAmountRupees.toLocaleString('en-IN')}
+                {' '}
+                <span className="text-rose-600">*</span>
+              </p>
+              <p className="text-[11px] text-slate-500">
+                Wallet refund is not available for subscriptions. Record the transfer before cancelling.
+              </p>
+              <AdminTransactionFields value={refundTxnForm} onChange={setRefundTxnForm} requireTxn />
+            </div>
+          ) : null}
+          <label className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-rose-900">
+            <input
+              type="checkbox"
+              checked={settlementConfirmed}
+              onChange={(e) => setSettlementConfirmed(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span>
+              I confirm all customer payments, driver payouts, refunds, working-day
+              obligations, and other settlement items have been completed.
+            </span>
+          </label>
+        </div>
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={approveCancelOpen}
+        onClose={() => {
+          if (submitting) return;
+          setApproveCancelOpen(false);
+          resetCancelForms();
+        }}
+        onConfirm={handleApproveCancelRequest}
+        title="Approve cancellation?"
+        description="Fill bank refund details, then cancel the subscription."
+        confirmLabel="Approve & cancel"
+        variant="danger"
+        loading={submitting}
+        confirmDisabled={!settlementConfirmed || !refundDetailsReady}
+      >
+        <div className="space-y-3">
+          {refundDetailsRequired ? (
+            <div className="rounded-xl border border-slate-200 bg-white p-3 space-y-2">
+              <p className="text-xs font-semibold text-slate-700">
+                Bank refund details for ₹{refundAmountRupees.toLocaleString('en-IN')}
+                {' '}
+                <span className="text-rose-600">*</span>
+              </p>
+              <p className="text-[11px] text-slate-500">
+                Wallet refund is not available for subscriptions.
+              </p>
+              <AdminTransactionFields value={refundTxnForm} onChange={setRefundTxnForm} requireTxn />
+            </div>
+          ) : null}
+          <label className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-rose-900">
+            <input
+              type="checkbox"
+              checked={settlementConfirmed}
+              onChange={(e) => setSettlementConfirmed(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span>
+              I confirm settlements are complete and it is safe to cancel this subscription.
+            </span>
+          </label>
+        </div>
+      </ConfirmDialog>
+    </Drawer>
+  );
+}
+
+function DetailLine({ label, value }) {
+  return (
+    <div>
+      <p className="text-[10px] uppercase text-slate-400 font-semibold">{label}</p>
+      <p className="text-sm font-medium text-slate-800">{value}</p>
+    </div>
+  );
+}
+
+function DriverFilterBar({ filters, onChange }) {
+  const set = (key, value) => onChange((prev) => ({ ...prev, [key]: value }));
+  return (
+    <div className="grid grid-cols-2 gap-2">
+      <label className="flex items-center gap-2 text-xs text-slate-600 col-span-2">
+        <input
+          type="checkbox"
+          checked={filters.zoneMatch === 'true'}
+          onChange={(e) => set('zoneMatch', e.target.checked ? 'true' : 'false')}
+        />
+        Only drivers in subscription zone
+      </label>
+      <label className="flex items-center gap-2 text-xs text-slate-600 col-span-2">
+        <input
+          type="checkbox"
+          checked={filters.carTypeMatch === 'true'}
+          onChange={(e) => set('carTypeMatch', e.target.checked ? 'true' : 'false')}
+        />
+        Match subscription car type experience
+      </label>
+      <label className="flex items-center gap-2 text-xs text-slate-600">
+        <input
+          type="checkbox"
+          checked={filters.onlineOnly}
+          onChange={(e) => set('onlineOnly', e.target.checked)}
+        />
+        Online only
+      </label>
+      <label className="flex items-center gap-2 text-xs text-slate-600">
+        <input
+          type="checkbox"
+          checked={filters.allIndiaOnly}
+          onChange={(e) => set('allIndiaOnly', e.target.checked)}
+        />
+        All-India OK
+      </label>
+      <input
+        type="number"
+        min="0"
+        max="5"
+        step="0.1"
+        placeholder="Min rating"
+        value={filters.minRating}
+        onChange={(e) => set('minRating', e.target.value)}
+        className="h-9 px-3 rounded-xl border border-slate-200 text-xs"
+      />
+      <input
+        type="number"
+        min="4"
+        max="16"
+        placeholder="Min hrs/day"
+        value={filters.minDrivingHoursPerDay}
+        onChange={(e) => set('minDrivingHoursPerDay', e.target.value)}
+        className="h-9 px-3 rounded-xl border border-slate-200 text-xs"
+      />
+    </div>
+  );
+}
+
+export default ManageUserSubscriptions;

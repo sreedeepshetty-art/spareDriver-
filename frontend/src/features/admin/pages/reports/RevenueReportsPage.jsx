@@ -1,0 +1,152 @@
+import { useMemo } from 'react';
+import { Link } from 'react-router-dom';
+import { DollarSign, ExternalLink, CircleSlash, TrendingUp } from 'lucide-react';
+import StatsCard from '../../components/StatsCard';
+import AnalyticsTrendChart from '../../components/UserAnalytics/AnalyticsTrendChart';
+import { SectionCard } from '../../components/DetailBlocks';
+import { useCachedQuery } from '../../../../hooks/useCachedQuery';
+import { buildCacheKey } from '../../../../store/lib/buildCacheKey';
+import { useAdminRevenueReportsStore } from '../../../../store/admin/useAdminRevenueReportsStore';
+import { formatCurrency } from '../../../../utils/formatters';
+import {
+  ReportPageHeader,
+  ReportLoadingState,
+  ReportErrorBanner,
+} from '../../components/reports/ReportPeriodFilters';
+import { useReportPeriod } from '../../components/reports/useReportPeriod';
+import ReportExportButtons from '../../components/reports/ReportExportButtons';
+
+function formatCount(n) {
+  return Number(n || 0).toLocaleString('en-IN');
+}
+
+const SOURCE_COLORS = {
+  commission: '#10B981',
+  platform_fee: '#0EA5E9',
+  coupon_discount: '#F59E0B',
+  cancellation_fee: '#F59E0B',
+  driver_penalty: '#EF4444',
+  subscription: '#8B5CF6',
+  admin_refund: '#64748B',
+};
+
+const RevenueReportsPage = () => {
+  const { period, setPeriod, fromDate, setFromDate, toDate, setToDate, queryParams } =
+    useReportPeriod('30d');
+
+  const cacheKey = useMemo(
+    () => buildCacheKey('admin-revenue-reports', queryParams),
+    [queryParams],
+  );
+
+  const { data, loading, error, refetch } = useCachedQuery(
+    useAdminRevenueReportsStore,
+    cacheKey,
+    queryParams,
+  );
+
+  const summary = data?.summary;
+  const breakdown = data?.breakdown;
+  const trends = data?.trends;
+
+  if (loading && !data) return <ReportLoadingState />;
+
+  return (
+    <div className="space-y-6">
+      <ReportPageHeader
+        title="Revenue Reports"
+        subtitle="Platform revenue analytics — for row-level ledger see Account → Revenue"
+        period={period}
+        onPeriodChange={setPeriod}
+        fromDate={fromDate}
+        toDate={toDate}
+        onFromDateChange={setFromDate}
+        onToDateChange={setToDate}
+        onRefresh={refetch}
+        loading={loading}
+        actions={
+          <>
+            <ReportExportButtons
+              exportPath="/admin/reports/revenue/export"
+              queryParams={queryParams}
+              filenamePrefix="revenue-report"
+            />
+            <Link
+              to="/admin/account/revenue"
+              className="inline-flex items-center gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-xl border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">View ledger</span>
+            </Link>
+          </>
+        }
+      />
+
+      {error && <ReportErrorBanner message={error} onRetry={refetch} />}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatsCard
+          icon={DollarSign}
+          label="Net platform revenue"
+          value={formatCurrency(summary?.totalRevenue)}
+          trend={summary?.trend}
+          trendLabel="vs previous period"
+          color="#10B981"
+        />
+        <StatsCard
+          icon={TrendingUp}
+          label="Commission"
+          value={formatCurrency(summary?.commission)}
+          color="#059669"
+        />
+        <StatsCard
+          icon={CircleSlash}
+          label="Coupons absorbed"
+          value={formatCurrency(summary?.couponsAbsorbed)}
+          color="#F59E0B"
+        />
+        <StatsCard
+          icon={DollarSign}
+          label="Previous period"
+          value={formatCurrency(summary?.previousPeriodTotal)}
+          color="#64748B"
+        />
+      </div>
+
+      <AnalyticsTrendChart
+        title="Daily revenue"
+        subtitle="Net platform revenue by day (commission + fees − coupons)"
+        points={trends?.revenue || []}
+        valueKey="amount"
+        formatValue={(v) => formatCurrency(v)}
+        color="#10B981"
+      />
+
+      <SectionCard title="Breakdown by source">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          {(breakdown?.bySource || []).map((row) => {
+            const isCoupon = row.source === 'coupon_discount';
+            const shown = isCoupon
+              ? row.displayAmount ?? Math.abs(Number(row.amount) || 0)
+              : row.amount;
+            return (
+              <div
+                key={row.source}
+                className="rounded-xl border border-slate-100 p-4"
+                style={{ borderLeftWidth: 4, borderLeftColor: SOURCE_COLORS[row.source] || '#94A3B8' }}
+              >
+                <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">{row.label}</p>
+                <p className={`text-xl font-bold mt-1 ${isCoupon ? 'text-amber-700' : 'text-slate-900'}`}>
+                  {isCoupon ? `−${formatCurrency(shown)}` : formatCurrency(shown)}
+                </p>
+                <p className="text-xs text-slate-400 mt-1">{formatCount(row.count)} entries</p>
+              </div>
+            );
+          })}
+        </div>
+      </SectionCard>
+    </div>
+  );
+};
+
+export default RevenueReportsPage;

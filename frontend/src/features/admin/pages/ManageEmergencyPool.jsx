@@ -1,0 +1,492 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import toast from 'react-hot-toast';
+import {
+  LifeBuoy,
+  MapPin,
+  Clock,
+  CalendarClock,
+  Search,
+  RefreshCw,
+  ShieldCheck,
+  AlertTriangle,
+  Filter,
+  ChevronDown,
+  Eye,
+  UserPlus,
+  User as UserIcon,
+} from 'lucide-react';
+import Card from '../../../components/Card';
+import Button from '../../../components/Button';
+import Input from '../../../components/Input';
+import Badge from '../../../components/Badge';
+import ServerPaginatedTable from '../components/ServerPaginatedTable';
+import BookingDetailsModal from '../components/ManageBookings/BookingDetailsModal';
+import AssignBookingDriverDrawer from '../components/ManageBookings/AssignBookingDriverDrawer';
+import RowActionsMenu from '../components/RowActionsMenu';
+import api from '../../../utils/api';
+import useAdminAuthStore from '../../../store/useAdminAuthStore';
+import { useSocketEvent } from '../../../hooks/useSocket';
+import { S2C_EVENTS } from '../../../constants/socketEvents';
+import { STAFF_ROLE_LABELS } from '../../../constants/staffRoles';
+import { formatPickupDateTime } from '../../../utils/datetime';
+
+const OPERATIONS_ROLES = new Set(['admin', 'sub_admin']);
+
+/**
+ * Admin "Emergency Pool" dashboard.
+ *
+ *   - Every staff role can view this page.
+ *   - super admin sees every booking in the pool (server scopes).
+ *   - sub_admin / team_member see only entries whose pickup falls in a
+ *     zone they are assigned to (also server-scoped via `assignedZones`).
+ *   - Only OPERATIONS roles get the "Assign driver" CTA; team_members
+ *     see a read-only "view-only — escalate to admin" pill.
+ *
+ * The page subscribes to `BOOKING_UPDATED` so the queue re-loads
+ * whenever the worker flips a new entry into `IN_EMERGENCY_POOL` or
+ * an admin assigns one out of it.
+ */
+const ManageEmergencyPool = () => {
+  const admin = useAdminAuthStore((s) => s.admin);
+  const canAssign = OPERATIONS_ROLES.has(admin?.role);
+
+  const [page, setPage] = useState(1);
+  const [limit] = useState(10);
+  const [search, setSearch] = useState('');
+  const [debounced, setDebounced] = useState('');
+  const [rows, setRows] = useState([]);
+  const [pagination, setPagination] = useState({ total: 0, pages: 1 });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [selectedBooking, setSelectedBooking] = useState(null);
+  const [detailBooking, setDetailBooking] = useState(null);
+
+  // Filters
+  const [zones, setZones] = useState([]);
+  const [filterZone, setFilterZone] = useState('');
+  const [filterType, setFilterType] = useState('');
+  const [filterDateFrom, setFilterDateFrom] = useState('');
+  const [filterDateTo, setFilterDateTo] = useState('');
+  const [showFilters, setShowFilters] = useState(false);
+
+  // Fetch available zones for the filter dropdown.
+  useEffect(() => {
+    api.get('/admin/zones').then((res) => {
+      setZones(res?.data?.data || []);
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(search), 300);
+    return () => clearTimeout(id);
+  }, [search]);
+
+  const fetchPool = useCallback(async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ page, limit });
+      if (debounced) params.append('search', debounced);
+      if (filterZone) params.append('zoneId', filterZone);
+      if (filterType) params.append('bookingType', filterType);
+      if (filterDateFrom) params.append('dateFrom', filterDateFrom);
+      if (filterDateTo) params.append('dateTo', filterDateTo);
+      const res = await api.get(`/admin/emergency-pool?${params.toString()}`);
+      const data = res?.data?.data || {};
+      setRows(data.bookings || []);
+      setPagination({
+        total: data.total || 0,
+        pages: data.pages || 1,
+      });
+      setError(null);
+    } catch (err) {
+      setError(err?.response?.data?.message || 'Failed to load the emergency pool');
+    } finally {
+      setLoading(false);
+    }
+  }, [page, limit, debounced, filterZone, filterType, filterDateFrom, filterDateTo]);
+
+  useEffect(() => {
+    fetchPool();
+  }, [fetchPool]);
+
+  useSocketEvent(S2C_EVENTS.BOOKING_UPDATED, () => {
+    fetchPool();
+  });
+  useSocketEvent(S2C_EVENTS.ADMIN_ALERT, (payload) => {
+    if (payload?.kind === 'emergency_pool_entered') fetchPool();
+  });
+
+  const activeFilterCount = [filterZone, filterType, filterDateFrom, filterDateTo].filter(Boolean).length;
+
+  const clearFilters = () => {
+    setFilterZone('');
+    setFilterType('');
+    setFilterDateFrom('');
+    setFilterDateTo('');
+    setPage(1);
+  };
+
+  const columns = useMemo(
+    () => [
+      {
+        key: 'bookingNumber',
+        label: 'Booking',
+        unclamp: true,
+        render: (_, row) => {
+          const at = row.hourly?.scheduledStartAt
+            ? new Date(row.hourly.scheduledStartAt)
+            : null;
+          const customerName = row.userId?.name || 'Unknown';
+
+          return (
+            <div className="min-w-0">
+              <div className="flex items-center justify-between gap-1.5 flex-wrap min-w-0">
+                <span className="font-mono text-xs font-bold bg-slate-100 px-2 py-0.5 rounded text-slate-900">
+                  {row.bookingNumber || row._id?.slice(-6)}
+                </span>
+                <span className="sm:hidden font-bold text-xs text-emerald-600">
+                  ₹{row.fareSnapshot?.total || 0}
+                </span>
+              </div>
+              <p className="sm:hidden text-xs text-slate-800 font-medium mt-1 truncate">
+                Cust: {customerName} {row.userId?.phone_no ? `(${row.userId.phone_no})` : ''}
+              </p>
+              <div className="sm:hidden text-[10px] text-slate-500 mt-0.5 truncate flex items-center gap-1">
+                <MapPin className="w-2.5 h-2.5 text-emerald-500 shrink-0" />
+                <span className="truncate">{row.pickup?.address || '—'}</span>
+              </div>
+              <div className="sm:hidden text-[10px] text-slate-400 mt-0.5 flex items-center justify-between gap-2">
+                <span>Pickup: {formatPickupDateTime(at)}</span>
+                <span className="shrink-0"><Countdown to={at} /></span>
+              </div>
+            </div>
+          );
+        },
+      },
+      {
+        key: 'customer',
+        label: 'Customer',
+        className: 'hidden sm:table-cell',
+        render: (_, row) => (
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-slate-900 truncate">
+              {row.userId?.name || 'Unknown'}
+            </p>
+            <p className="text-[11px] text-slate-500 truncate">
+              {row.userId?.phone_no || '—'}
+            </p>
+          </div>
+        ),
+      },
+      {
+        key: 'pickup',
+        label: 'Pickup',
+        className: 'hidden md:table-cell',
+        render: (_, row) => (
+          <div className="min-w-0">
+            <p className="text-xs text-slate-700 truncate" title={row.pickup?.address}>
+              {row.pickup?.address || '—'}
+            </p>
+            {(row.zoneIds || []).length > 0 && (
+              <div className="flex flex-wrap gap-1 mt-1">
+                {row.zoneIds.slice(0, 2).map((z) => (
+                  <span
+                    key={z._id || z}
+                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-700 text-[10px] font-semibold"
+                  >
+                    <MapPin className="w-2.5 h-2.5" />
+                    {z?.name || 'Zone'}
+                  </span>
+                ))}
+                {row.zoneIds.length > 2 && (
+                  <span className="text-[10px] text-slate-500">
+                    +{row.zoneIds.length - 2} more
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        ),
+      },
+      {
+        key: 'scheduledStartAt',
+        label: 'Pickup time',
+        className: 'hidden md:table-cell',
+        render: (_, row) => {
+          const at = row.hourly?.scheduledStartAt
+            ? new Date(row.hourly.scheduledStartAt)
+            : null;
+          return (
+            <div>
+              <p className="text-xs font-medium text-slate-800">
+                {formatPickupDateTime(at)}
+              </p>
+              <p className="text-[10px] text-slate-500">
+                <Countdown to={at} />
+              </p>
+            </div>
+          );
+        },
+      },
+      {
+        key: 'fare',
+        label: 'Fare',
+        className: 'hidden sm:table-cell',
+        render: (_, row) => (
+          <span className="text-sm font-semibold text-emerald-600">
+            ₹{row.fareSnapshot?.total || 0}
+          </span>
+        ),
+      },
+      {
+        key: 'actions',
+        label: 'Action',
+        sortable: false,
+        unclamp: true,
+        width: '40px',
+        render: (_, row) => {
+          const items = [
+            {
+              label: 'View',
+              icon: Eye,
+              onClick: () => setDetailBooking(row),
+            },
+          ];
+          if (canAssign) {
+            items.push({
+              label: 'Assign',
+              icon: UserPlus,
+              onClick: () => setSelectedBooking(row),
+            });
+          }
+          return <RowActionsMenu items={items} />;
+        },
+      },
+    ],
+    [canAssign],
+  );
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-3 sm:p-4 lg:p-6 space-y-5 animate-fade-in-up pb-10">
+      {/* Hero banner */}
+      <div className="bg-gradient-to-br from-amber-500 to-orange-500 text-white rounded-2xl sm:rounded-3xl p-3.5 sm:p-5 shadow-sm flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+          <div className="w-9 h-9 sm:w-11 sm:h-11 rounded-xl sm:rounded-2xl bg-white/15 flex items-center justify-center shrink-0">
+            <LifeBuoy className="w-4 h-4 sm:w-5 sm:h-5" />
+          </div>
+          <div className="min-w-0">
+            <h1 className="text-base sm:text-lg font-bold truncate">Emergency Pool</h1>
+            <p className="hidden sm:block text-[12px] text-white/80 mt-0.5 leading-snug">
+              Scheduled rides we couldn&apos;t auto-assign{' '}
+              {admin?.role === 'admin' ? (
+                <>across the platform</>
+              ) : (
+                <>in your zones</>
+              )}{' '}
+              within the safety window. {canAssign ? 'Pick a nearby driver to take them off the queue.' : 'Admins will assign drivers manually.'}
+            </p>
+          </div>
+        </div>
+        <div className="text-right shrink-0">
+          <p className="text-[9px] sm:text-[11px] uppercase tracking-wide text-white/70">In pool</p>
+          <p className="text-2xl sm:text-3xl font-bold leading-tight">{pagination.total}</p>
+        </div>
+      </div>
+
+      {!canAssign && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 flex items-start gap-3">
+          <div className="w-9 h-9 rounded-xl bg-amber-100 text-amber-700 flex items-center justify-center shrink-0">
+            <ShieldCheck className="w-4 h-4" />
+          </div>
+          <div className="min-w-0">
+            <p className="text-sm font-bold text-amber-900">
+              {STAFF_ROLE_LABELS[admin?.role] || 'Team member'} access
+            </p>
+            <p className="text-[12px] text-amber-800 leading-snug mt-0.5">
+              You can monitor bookings in your assigned zones. Only admins
+              and sub-admins can assign a driver.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Search + Filters */}
+      <Card>
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-col md:flex-row md:items-center gap-3">
+            <div className="flex-1">
+              <Input
+                icon={Search}
+                placeholder="Search booking number or ID"
+                value={search}
+                onChange={(e) => {
+                  setSearch(e.target.value);
+                  setPage(1);
+                }}
+              />
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setShowFilters((v) => !v)}
+                className={`inline-flex items-center gap-2 px-3 py-2 rounded-xl border text-sm font-medium transition ${
+                  showFilters || activeFilterCount > 0
+                    ? 'border-amber-400 bg-amber-50 text-amber-700'
+                    : 'border-slate-200 text-slate-600 hover:border-slate-300'
+                }`}
+              >
+                <Filter className="w-4 h-4" />
+                Filters
+                {activeFilterCount > 0 && (
+                  <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-amber-500 text-white text-[10px] font-bold">
+                    {activeFilterCount}
+                  </span>
+                )}
+                <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showFilters ? 'rotate-180' : ''}`} />
+              </button>
+              <button
+                type="button"
+                onClick={fetchPool}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 text-xs sm:text-sm font-medium text-slate-600 hover:bg-slate-50 transition"
+              >
+                <RefreshCw className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                <span className="hidden sm:inline">Refresh</span>
+              </button>
+            </div>
+          </div>
+
+          {showFilters && (
+            <div className="border-t border-slate-100 pt-3 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+              {/* Zone filter */}
+              <div>
+                <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-1.5">Zone</p>
+                <select
+                  value={filterZone}
+                  onChange={(e) => { setFilterZone(e.target.value); setPage(1); }}
+                  className="w-full text-sm rounded-xl border border-slate-200 px-3 py-2 focus:outline-none focus:border-amber-400 bg-white"
+                >
+                  <option value="">All zones</option>
+                  {zones.map((z) => (
+                    <option key={z._id} value={z._id}>{z.name} — {z.city || z.code}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Booking type */}
+              <div>
+                <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-1.5">Booking type</p>
+                <select
+                  value={filterType}
+                  onChange={(e) => { setFilterType(e.target.value); setPage(1); }}
+                  className="w-full text-sm rounded-xl border border-slate-200 px-3 py-2 focus:outline-none focus:border-amber-400 bg-white"
+                >
+                  <option value="">All types</option>
+                  <option value="instant">Instant</option>
+                  <option value="scheduled">Scheduled</option>
+                </select>
+              </div>
+
+              {/* Date from */}
+              <div>
+                <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-1.5">Pickup from</p>
+                <input
+                  type="datetime-local"
+                  value={filterDateFrom}
+                  onChange={(e) => { setFilterDateFrom(e.target.value); setPage(1); }}
+                  className="w-full text-sm rounded-xl border border-slate-200 px-3 py-2 focus:outline-none focus:border-amber-400 bg-white"
+                />
+              </div>
+
+              {/* Date to */}
+              <div>
+                <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-1.5">Pickup to</p>
+                <input
+                  type="datetime-local"
+                  value={filterDateTo}
+                  onChange={(e) => { setFilterDateTo(e.target.value); setPage(1); }}
+                  className="w-full text-sm rounded-xl border border-slate-200 px-3 py-2 focus:outline-none focus:border-amber-400 bg-white"
+                />
+              </div>
+
+              {activeFilterCount > 0 && (
+                <div className="sm:col-span-2 xl:col-span-4 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={clearFilters}
+                    className="text-xs text-slate-500 hover:text-rose-600 transition"
+                  >
+                    Clear all filters
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </Card>
+
+      {error && (
+        <div className="p-4 bg-rose-50 border border-rose-100 rounded-2xl text-rose-600 text-sm">
+          {error}
+        </div>
+      )}
+
+      <ServerPaginatedTable
+        minWidth="w-full min-w-0"
+        columns={columns}
+        data={rows}
+        loading={loading}
+        page={page}
+        limit={limit}
+        pagination={pagination}
+        onPageChange={setPage}
+        onRowClick={(row) => setDetailBooking(row)}
+        entityLabel="bookings"
+        emptyMessage="No bookings need manual assignment right now."
+      />
+
+      {selectedBooking && (
+        <AssignBookingDriverDrawer
+          booking={selectedBooking}
+          onClose={() => setSelectedBooking(null)}
+          onAssigned={() => {
+            setSelectedBooking(null);
+            fetchPool();
+          }}
+        />
+      )}
+
+      <BookingDetailsModal
+        isOpen={!!detailBooking}
+        onClose={() => setDetailBooking(null)}
+        booking={detailBooking}
+      />
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+
+function Countdown({ to }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  if (!to) return null;
+  const diffMs = to.getTime() - now;
+  const past = diffMs < 0;
+  const sec = Math.max(0, Math.floor(Math.abs(diffMs) / 1000));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const stamp = h > 0 ? `${h}h ${m}m` : `${m}m`;
+  return (
+    <span
+      className={`inline-flex items-center gap-1 ${past ? 'text-rose-600 font-semibold' : 'text-slate-500'}`}
+    >
+      <Clock className="w-3 h-3" />
+      {past ? `${stamp} overdue` : `in ${stamp}`}
+    </span>
+  );
+}
+
+export default ManageEmergencyPool;

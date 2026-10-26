@@ -1,0 +1,181 @@
+import express from 'express';
+import cookieParser from 'cookie-parser';
+import cors from 'cors';
+import { getCorsOptions } from './config/cors.config.js';
+
+import commonRoutes from './routes/common.route.js';
+import driverRoutes from './routes/driver.route.js';
+import adminRoutes from './routes/admin.route.js';
+import authRoutes from './routes/user.routes.js';
+import webhookRoutes from './routes/webhook.route.js';
+import sosRoutes from './routes/sos.route.js';
+import supportRoutes from './routes/support.route.js';
+import { protectUser } from './middlewares/authMiddleware.js';
+import { getUserFirebaseToken } from './controllers/firebaseAuth.controller.js';
+
+// Dev-only routes — imported lazily so they are fully tree-shaken in production.
+const loadDevRoutes = () => import('./routes/dev.route.js').then((m) => m.default);
+
+const app = express();
+
+// We sit behind a TLS-terminating proxy on Vercel/Render/Heroku/etc. Without
+// this Express thinks the request is HTTP, which leads to "Secure" cookies
+// being set against a perceived-insecure connection in some flows and breaks
+// `req.secure`, `req.protocol`, and `req.ip`.
+app.set('trust proxy', 1);
+
+app.use(cors(getCorsOptions()));
+app.use(cookieParser());
+app.use('/api/v1/webhooks', webhookRoutes);
+app.use(express.json({ limit: '16kb' }));
+app.use(express.urlencoded({ extended: true, limit: '16kb' }));
+
+app.use('/api/v1/auth', authRoutes);
+// Alias: native/Flutter customers call `/api/v1/user/firebase-token`.
+// Canonical path is `/api/v1/auth/firebase-token` (user router lives under /auth).
+app.get('/api/v1/user/firebase-token', protectUser, getUserFirebaseToken);
+app.use('/api/v1/common', commonRoutes);
+app.use('/api/v1/driver', driverRoutes);
+// Flutter AppConfig sometimes concatenates `{host}/v1/driver/...` and drops `/api`.
+app.use('/v1/driver', driverRoutes);
+app.use('/api/v1/admin', adminRoutes);
+app.use('/api/v1/sos', sosRoutes);
+app.use('/api/v1/support', supportRoutes);
+
+// Mount dev test routes in non-production environments only.
+if (process.env.NODE_ENV !== 'production') {
+  loadDevRoutes().then((devRouter) => {
+    app.use('/api/v1/dev', devRouter);
+    console.log('[dev] Test routes mounted at /api/v1/dev');
+  });
+}
+
+// Apple Universal Links (AASA) & Android App Links
+const appleAppSiteAssociation = {
+  applinks: {
+    apps: [],
+    details: [
+      {
+        appIDs: [
+          'M7LK6345UM.com.spareDriver.user',
+          'M7LK6345UM.com.spareDriver.driver',
+        ],
+        components: [
+          { '/': '/r/*', comment: 'Referral invite links' },
+        ],
+        paths: ['/r/*'],
+      },
+    ],
+  },
+  webcredentials: {
+    apps: [
+      'M7LK6345UM.com.spareDriver.user',
+      'M7LK6345UM.com.spareDriver.driver',
+    ],
+  },
+};
+
+const assetlinks = [
+  {
+    relation: ['delegate_permission/common.handle_all_urls'],
+    target: {
+      namespace: 'android_app',
+      package_name: 'com.spareDriver.user',
+      sha256_cert_fingerprints: [
+        '68:48:DF:BF:F2:E9:61:65:0C:57:5D:37:66:1A:6F:C4:4E:2E:F6:2F:D5:DD:87:C8:F4:A5:07:27:92:BE:F4:4E',
+      ],
+    },
+  },
+  {
+    relation: ['delegate_permission/common.handle_all_urls'],
+    target: {
+      namespace: 'android_app',
+      package_name: 'com.spareDriver.driver',
+      sha256_cert_fingerprints: [
+        '40:91:B8:54:B2:60:B9:94:CC:D3:CB:76:64:FA:7C:1F:28:EF:8D:70:57:92:D9:13:D7:CC:83:6A:A2:95:76:5C',
+      ],
+    },
+  },
+];
+
+app.get(
+  ['/.well-known/apple-app-site-association', '/apple-app-site-association'],
+  (_req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.status(200).json(appleAppSiteAssociation);
+  },
+);
+
+app.get(['/.well-known/assetlinks.json', '/assetlinks.json'], (_req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.status(200).json(assetlinks);
+});
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok' });
+});
+
+app.get('/', (_req, res) => {
+  res.send('SpareDriver API');
+});
+
+app.use((err, req, res, _next) => {
+  // Zod validation failures are client errors, not server errors. Without this
+  // they fall through to the 500 branch and surface a raw JSON blob as the
+  // message, which is unreadable in the app and unhelpful in the logs.
+  if (err?.name === 'ZodError') {
+    const issues = err.issues || err.errors || [];
+    const first = issues[0];
+    const field = first?.path?.length ? first.path.join('.') : null;
+    const url = req.originalUrl || req.url || '';
+    if (url.includes('/driver/location') || url.includes('/tracking/token')) {
+      console.log(
+        `[flutter] BAD-BODY path=${url}` +
+          ` field=${field || '-'}` +
+          ` message=${first?.message || 'Invalid request body'}`,
+      );
+    }
+    return res.status(400).json({
+      status: 400,
+      message: first
+        ? `${field ? `${field}: ` : ''}${first.message}`
+        : 'Invalid request body',
+      data: {
+        issues: issues.map((i) => ({
+          field: i.path?.join('.') || '',
+          message: i.message,
+        })),
+      },
+    });
+  }
+
+  if (err.code === 11000) {
+    const field = Object.keys(err.keyPattern || err.keyValue || {})[0] || 'field';
+    const fieldName = field === 'phone_no' ? 'phone number' : field;
+    const value = err.keyValue ? err.keyValue[field] : '';
+    const cleanMessage = `A record with this ${fieldName}${value ? ` (${value})` : ''} already exists.`;
+    return res.status(400).json({
+      status: 400,
+      message: cleanMessage,
+    });
+  }
+
+  if (err?.name === 'ZodError' && Array.isArray(err.issues)) {
+    const message = err.issues[0]?.message || 'Invalid request';
+    return res.status(400).json({
+      status: 400,
+      message,
+    });
+  }
+
+  const statusCode = err.statusCode || 500;
+  const message = err.message || 'Internal Server Error';
+  console.error(`[ERROR] ${req.method} ${req.url} - ${err.stack}`);
+  res.status(statusCode).json({
+    status: statusCode,
+    message,
+    ...(err.data != null ? { data: err.data } : {}),
+  });
+});
+
+export default app;

@@ -1,0 +1,280 @@
+import User from '../models/user.model.js';
+import { Driver } from '../models/driverModels/driver.model.js';
+import Booking from '../models/booking.model.js';
+import PlatformRevenue, { PLATFORM_REVENUE_SOURCE } from '../models/platformRevenue.model.js';
+import UserSubscription from '../models/userSubscription.model.js';
+import { USER_ROLES } from '../constants/roles.js';
+import { BOOKING_STATUS } from '../constants/bookingStatus.js';
+import {
+  round2,
+  resolveDateRange,
+  resolvePreviousRange,
+  mongoDateRange,
+  percentChange,
+  fillDailyTrend,
+  bookingFareExpr,
+  bookingGstExpr,
+  subscriptionGstExpr,
+  buildFiltersMeta,
+  mongoDayBucket
+} from '../utils/reportDateRange.js';
+
+const USER_FILTER = { role: USER_ROLES.USER, isDeleted: false };
+const DRIVER_FILTER = { isDeleted: false };
+const BOOKING_FILTER = { isDeleted: false };
+const TRIP_REVENUE_MATCH = {
+  source: { $nin: [PLATFORM_REVENUE_SOURCE.SUBSCRIPTION] },
+};
+
+function dateMatch(range, field = 'createdAt') {
+  const m = mongoDateRange(range, field);
+  return m || {};
+}
+
+export async function getAdminReportsOverviewService(query = {}) {
+  const dateRange = resolveDateRange(query);
+  const prevRange = resolvePreviousRange(dateRange);
+  const bookingDate = dateMatch(dateRange);
+  const prevBookingDate = dateMatch(prevRange);
+  const revenueDate = dateMatch(dateRange, 'occurredAt');
+  const prevRevenueDate = dateMatch(prevRange, 'occurredAt');
+
+  const [
+    usersInPeriod,
+    usersPrevPeriod,
+    driversInPeriod,
+    driversPrevPeriod,
+    bookingsInPeriod,
+    bookingsPrevPeriod,
+    tripRevenueAgg,
+    tripRevenuePrevAgg,
+    platformRevenueAgg,
+    platformRevenuePrevAgg,
+    commissionOnlyAgg,
+    commissionOnlyPrevAgg,
+    couponAbsorbedAgg,
+    couponAbsorbedPrevAgg,
+    gstBookingsAgg,
+    gstBookingsPrevAgg,
+    gstSubsAgg,
+    gstSubsPrevAgg,
+    bookingTrendRaw,
+    revenueTrendRaw,
+    gstTrendRaw,
+  ] = await Promise.all([
+    User.countDocuments({ ...USER_FILTER, ...dateMatch(dateRange) }),
+    User.countDocuments({ ...USER_FILTER, ...prevBookingDate }),
+    Driver.countDocuments({ ...DRIVER_FILTER, ...dateMatch(dateRange) }),
+    Driver.countDocuments({ ...DRIVER_FILTER, ...prevBookingDate }),
+    Booking.countDocuments({ ...BOOKING_FILTER, ...bookingDate }),
+    Booking.countDocuments({ ...BOOKING_FILTER, ...prevBookingDate }),
+    Booking.aggregate([
+      {
+        $match: {
+          ...BOOKING_FILTER,
+          status: BOOKING_STATUS.COMPLETED,
+          ...bookingDate,
+        },
+      },
+      { $group: { _id: null, total: { $sum: bookingFareExpr() } } },
+    ]),
+    Booking.aggregate([
+      {
+        $match: {
+          ...BOOKING_FILTER,
+          status: BOOKING_STATUS.COMPLETED,
+          ...prevBookingDate,
+        },
+      },
+      { $group: { _id: null, total: { $sum: bookingFareExpr() } } },
+    ]),
+    PlatformRevenue.aggregate([
+      { $match: { ...TRIP_REVENUE_MATCH, ...revenueDate } },
+      { $group: { _id: null, total: { $sum: '$amountRupees' } } },
+    ]),
+    PlatformRevenue.aggregate([
+      { $match: { ...TRIP_REVENUE_MATCH, ...prevRevenueDate } },
+      { $group: { _id: null, total: { $sum: '$amountRupees' } } },
+    ]),
+    PlatformRevenue.aggregate([
+      {
+        $match: {
+          source: PLATFORM_REVENUE_SOURCE.COMMISSION,
+          ...revenueDate,
+        },
+      },
+      { $group: { _id: null, total: { $sum: '$amountRupees' } } },
+    ]),
+    PlatformRevenue.aggregate([
+      {
+        $match: {
+          source: PLATFORM_REVENUE_SOURCE.COMMISSION,
+          ...prevRevenueDate,
+        },
+      },
+      { $group: { _id: null, total: { $sum: '$amountRupees' } } },
+    ]),
+    PlatformRevenue.aggregate([
+      {
+        $match: {
+          source: PLATFORM_REVENUE_SOURCE.COUPON_DISCOUNT,
+          ...revenueDate,
+        },
+      },
+      { $group: { _id: null, total: { $sum: '$amountRupees' } } },
+    ]),
+    PlatformRevenue.aggregate([
+      {
+        $match: {
+          source: PLATFORM_REVENUE_SOURCE.COUPON_DISCOUNT,
+          ...prevRevenueDate,
+        },
+      },
+      { $group: { _id: null, total: { $sum: '$amountRupees' } } },
+    ]),
+    Booking.aggregate([
+      {
+        $match: {
+          ...BOOKING_FILTER,
+          status: BOOKING_STATUS.COMPLETED,
+          ...bookingDate,
+        },
+      },
+      { $group: { _id: null, total: { $sum: bookingGstExpr() } } },
+    ]),
+    Booking.aggregate([
+      {
+        $match: {
+          ...BOOKING_FILTER,
+          status: BOOKING_STATUS.COMPLETED,
+          ...prevBookingDate,
+        },
+      },
+      { $group: { _id: null, total: { $sum: bookingGstExpr() } } },
+    ]),
+    UserSubscription.aggregate([
+      {
+        $match: {
+          paidAt: { $ne: null },
+          ...dateMatch(dateRange, 'paidAt'),
+        },
+      },
+      { $group: { _id: null, total: { $sum: subscriptionGstExpr() } } },
+    ]),
+    UserSubscription.aggregate([
+      {
+        $match: {
+          paidAt: { $ne: null },
+          ...dateMatch(prevRange, 'paidAt'),
+        },
+      },
+      { $group: { _id: null, total: { $sum: subscriptionGstExpr() } } },
+    ]),
+    Booking.aggregate([
+      { $match: { ...BOOKING_FILTER, ...bookingDate } },
+      {
+        $group: {
+          _id: mongoDayBucket('$createdAt'),
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]),
+    PlatformRevenue.aggregate([
+      { $match: { ...TRIP_REVENUE_MATCH, ...revenueDate } },
+      {
+        $group: {
+          _id: mongoDayBucket('$occurredAt'),
+          amount: { $sum: '$amountRupees' },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]),
+    Booking.aggregate([
+      {
+        $match: {
+          ...BOOKING_FILTER,
+          status: BOOKING_STATUS.COMPLETED,
+          ...bookingDate,
+        },
+      },
+      {
+        $group: {
+          _id: mongoDayBucket('$createdAt'),
+          amount: { $sum: bookingGstExpr() },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]),
+  ]);
+
+  const tripRevenue = round2(tripRevenueAgg[0]?.total || 0);
+  const tripRevenuePrev = round2(tripRevenuePrevAgg[0]?.total || 0);
+  const platformRevenue = round2(platformRevenueAgg[0]?.total || 0);
+  const platformRevenuePrev = round2(platformRevenuePrevAgg[0]?.total || 0);
+  const commission = round2(commissionOnlyAgg[0]?.total || 0);
+  const commissionPrev = round2(commissionOnlyPrevAgg[0]?.total || 0);
+  const couponsAbsorbed = round2(Math.abs(couponAbsorbedAgg[0]?.total || 0));
+  const couponsAbsorbedPrev = round2(Math.abs(couponAbsorbedPrevAgg[0]?.total || 0));
+  const bookingGst = round2(gstBookingsAgg[0]?.total || 0);
+  const subscriptionGst = round2(gstSubsAgg[0]?.total || 0);
+  const gstCollected = round2(bookingGst + subscriptionGst);
+  const gstPrev = round2(
+    (gstBookingsPrevAgg[0]?.total || 0) + (gstSubsPrevAgg[0]?.total || 0),
+  );
+
+  return {
+    filters: buildFiltersMeta(query, dateRange),
+    summary: {
+      users: {
+        count: usersInPeriod,
+        trend: percentChange(usersInPeriod, usersPrevPeriod),
+      },
+      drivers: {
+        count: driversInPeriod,
+        trend: percentChange(driversInPeriod, driversPrevPeriod),
+      },
+      bookings: {
+        count: bookingsInPeriod,
+        trend: percentChange(bookingsInPeriod, bookingsPrevPeriod),
+      },
+      tripRevenue: {
+        amount: tripRevenue,
+        trend: percentChange(tripRevenue, tripRevenuePrev),
+      },
+      /** Net platform take (commission + fees − coupons absorbed, etc.). */
+      platformRevenue: {
+        amount: platformRevenue,
+        trend: percentChange(platformRevenue, platformRevenuePrev),
+      },
+      /** Gross commission only — coupons are NOT deducted here. */
+      platformCommission: {
+        amount: commission,
+        trend: percentChange(commission, commissionPrev),
+      },
+      couponsAbsorbed: {
+        amount: couponsAbsorbed,
+        trend: percentChange(couponsAbsorbed, couponsAbsorbedPrev),
+      },
+      gstCollected: {
+        amount: gstCollected,
+        bookingGst,
+        subscriptionGst,
+        trend: percentChange(gstCollected, gstPrev),
+      },
+    },
+    trends: {
+      bookings: fillDailyTrend(bookingTrendRaw, 'count', dateRange),
+      revenue: fillDailyTrend(
+        revenueTrendRaw.map((r) => ({ _id: r._id, amount: round2(r.amount) })),
+        'amount',
+        dateRange,
+      ),
+      gst: fillDailyTrend(
+        gstTrendRaw.map((r) => ({ _id: r._id, amount: round2(r.amount) })),
+        'amount',
+        dateRange,
+      ),
+    },
+  };
+}
