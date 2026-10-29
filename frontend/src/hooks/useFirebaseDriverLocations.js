@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { onValue, ref, off } from 'firebase/database';
 import { getRealtimeDb, isFirebaseConfigured } from '../config/firebase';
-import { ensureFirebaseAuth } from '../config/firebaseAuth';
+import { ensureFirebaseAuth, getLastFirebaseAuthFailureReason } from '../config/firebaseAuth';
 
 /**
  * Subscribe to every driver entry under `/drivers` in Firebase Realtime DB.
@@ -63,7 +63,12 @@ export function useFirebaseDriverLocations({ enabled = true } = {}) {
       const authed = await ensureFirebaseAuth('admin');
       if (cancelled) return;
       if (!authed) {
-        setError('Not authorised for the live driver feed');
+        const reason = getLastFirebaseAuthFailureReason();
+        if (reason === 'firebase_not_configured') {
+          setError('Backend Firebase credentials are not configured (secrets/firebase.json missing). Provide FIREBASE_SERVICE_ACCOUNT_JSON in backend/.env to enable live tracking.');
+        } else {
+          setError('Not authorised for the live driver feed');
+        }
         return;
       }
 

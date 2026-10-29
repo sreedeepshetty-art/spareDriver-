@@ -3,9 +3,6 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { firebaseMessagingSwPlugin } from './vite/firebaseMessagingSwPlugin.js'
 import { appleAppSiteAssociationPlugin } from './vite/appleAppSiteAssociationPlugin.js'
-import { createRequire } from 'module';
-
-const require = createRequire(import.meta.url);
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), firebaseMessagingSwPlugin(), appleAppSiteAssociationPlugin()],

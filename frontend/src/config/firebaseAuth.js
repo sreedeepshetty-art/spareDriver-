@@ -32,6 +32,11 @@ let signedInAt = 0;
 let signedInScope = null;
 /** bookingId baked into the current token, so a ride change forces a re-mint. */
 let signedInBookingId = null;
+let lastFailureReason = null;
+
+export function getLastFirebaseAuthFailureReason() {
+  return lastFailureReason;
+}
 
 function auth() {
   if (authInstance) return authInstance;
@@ -75,14 +80,23 @@ export async function ensureFirebaseAuth(audience = 'user', opts = {}) {
         try {
           const res = await api.get(path);
           data = res.data?.data;
-          if (data?.token) break;
+          if (data?.token) {
+            lastFailureReason = null;
+            break;
+          }
+          if (data?.reason) {
+            lastFailureReason = data.reason;
+          }
         } catch (err) {
           if (err?.response?.status !== 404 || path === paths[paths.length - 1]) {
             throw err;
           }
         }
       }
-      if (!data?.token) return false;
+      if (!data?.token) {
+        if (!lastFailureReason && data?.reason) lastFailureReason = data.reason;
+        return false;
+      }
 
       await signInWithCustomToken(a, data.token);
       signedInAt = Date.now();
